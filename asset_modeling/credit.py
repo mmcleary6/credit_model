@@ -243,8 +243,8 @@ def private_credit_loan_model(
     exit_fee,
     prepayment_date,
 ):
-    
-    if prepayment_date is None:
+
+    if prepayment_date is None or pd.isna(prepayment_date):
         end_date = maturity_date
     else:
         end_date = prepayment_date
