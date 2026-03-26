@@ -64,14 +64,6 @@ def default_schedule() -> pd.DataFrame:
     return pd.DataFrame([_default_row(1), _default_row(2)])
 
 
-def _parse_patch_field(patch: object, keys: tuple[str, ...]):
-    for key in keys:
-        if isinstance(patch, dict) and key in patch:
-            return patch[key]
-        if hasattr(patch, key):
-            return getattr(patch, key)
-    raise KeyError(f"Patch does not contain fields {keys}")
-
 
 def _normalize_numeric_value(value: object):
     if isinstance(value, str):
@@ -115,7 +107,7 @@ def _coerce_schedule(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in NUMERIC_COLUMNS:
         normalized_numeric = working_df[col].apply(_normalize_numeric_value)
-        working_df[col] = pd.to_numeric(normalized_numeric, errors="coerce")
+        working_df[col] = pd.to_numeric(normalized_numeric, errors="coerce").astype(float)
         if working_df[col].isna().any():
             raise ValueError(
                 f"Column '{col}' must be numeric (examples: 1000000, 1,000,000, 8%)."
@@ -212,28 +204,29 @@ def server(input, output, session):
     def schedule_df():
         return render.DataGrid(schedule_state(), editable=True)
 
-    @schedule_df.set_patch_fn
-    def _patch_schedule(patch):
+    @schedule_df.set_patches_fn
+    def _patch_schedule(*, patches: list[render.CellPatch]) -> list[render.CellPatch]:
         df = schedule_state().copy()
-        row_index = int(_parse_patch_field(patch, ("row_index", "row")))
-        column_index = int(_parse_patch_field(patch, ("column_index", "col")))
-        new_value = _parse_patch_field(patch, ("value",))
-
-        column_name = df.columns[column_index]
-        if column_name in NUMERIC_COLUMNS:
-            normalized_value = _normalize_numeric_value(new_value)
-            if normalized_value is None:
-                df.iat[row_index, column_index] = ""
+        for patch in patches:
+            row_index = patch["row_index"]
+            column_index = patch["column_index"]
+            new_value = patch["value"]
+            column_name = df.columns[column_index]
+            if column_name in NUMERIC_COLUMNS:
+                normalized_value = _normalize_numeric_value(new_value)
+                if normalized_value is None:
+                    df.iat[row_index, column_index] = ""
+                else:
+                    try:
+                        coerced = float(normalized_value)
+                        df.iat[row_index, column_index] = coerced
+                        patch["value"] = coerced
+                    except (TypeError, ValueError):
+                        df.iat[row_index, column_index] = new_value
             else:
-                try:
-                    df.iat[row_index, column_index] = float(normalized_value)
-                except (TypeError, ValueError):
-                    df.iat[row_index, column_index] = new_value
-        else:
-            df.iat[row_index, column_index] = new_value
-
+                df.iat[row_index, column_index] = new_value
         schedule_state.set(df)
-        return df.iat[row_index, column_index]
+        return patches
 
     @reactive.calc
     def portfolio_results():
