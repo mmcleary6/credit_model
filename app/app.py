@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from pathlib import Path
+import random
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -45,9 +46,9 @@ NUMERIC_COLUMNS = [
 def _default_row(index: int) -> dict:
     return {
         "investment_name": f"Loan {index}",
-        "investment_date": "2024-03-31",
-        "maturity_date": "2029-03-31",
-        "loan_size": 100000000,
+        "investment_date": "2020-12-31",
+        "maturity_date": "2030-12-31",
+        "loan_size": 15000000,
         "spread": 0.06,
         "base_rate": "SOFR",
         "sofr_assumption": 0.04,
@@ -60,8 +61,57 @@ def _default_row(index: int) -> dict:
     }
 
 
+def _random_quarter_end(
+    random_generator: random.Random,
+    start_date: str,
+    end_date: str,
+) -> pd.Timestamp:
+    quarter_ends = pd.date_range(start=start_date, end=end_date, freq="QE")
+    return random_generator.choice(list(quarter_ends))
+
+
 def default_schedule() -> pd.DataFrame:
-    return pd.DataFrame([_default_row(1), _default_row(2)])
+    random_generator = random.Random()
+    rows = []
+
+    for index in range(1, 26):
+        row = _default_row(index)
+        investment_date = _random_quarter_end(
+            random_generator,
+            "2020-12-31",
+            "2024-12-31",
+        )
+        maturity_date = _random_quarter_end(
+            random_generator,
+            "2030-12-31",
+            "2035-12-31",
+        )
+        row["investment_date"] = investment_date.strftime("%Y-%m-%d")
+        row["maturity_date"] = maturity_date.strftime("%Y-%m-%d")
+        row["loan_size"] = int(
+            round(random_generator.uniform(15000000, 100000000) / 1_000_000)
+            * 1_000_000
+        )
+        row["oid"] = round(random_generator.uniform(0.02, 0.05), 4)
+        row["sofr_assumption"] = round(random_generator.uniform(0.035, 0.04), 4)
+        row["spread"] = round(random_generator.uniform(0.08, 0.11), 4)
+        row["cash_interest_rate"] = round(
+            row["sofr_assumption"] + row["spread"] - row["pik_interest"], 4
+        )
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
+def _sort_schedule_by_investment_date(df: pd.DataFrame) -> pd.DataFrame:
+    sorted_df = (
+        df.assign(_investment_date_sort=pd.to_datetime(df["investment_date"]))
+        .sort_values("_investment_date_sort", kind="stable")
+        .drop(columns="_investment_date_sort")
+        .reset_index(drop=True)
+    )
+    sorted_df["investment_name"] = [f"Loan {i + 1}" for i in range(len(sorted_df))]
+    return sorted_df
 
 
 
@@ -168,7 +218,7 @@ app_ui = ui.page_navbar(
         ),
         ui.layout_columns(
             output_widget("balance_chart"),
-            output_widget("interest_principal_chart"),
+            output_widget("portfolio_irr_chart"),
             col_widths=(6, 6),
         ),
         ui.h4("IRR Summary"),
@@ -179,14 +229,14 @@ app_ui = ui.page_navbar(
 
 
 def server(input, output, session):
-    schedule_state = reactive.value(default_schedule())
+    schedule_state = reactive.value(_sort_schedule_by_investment_date(default_schedule()))
 
     @reactive.effect
     @reactive.event(input.add_row)
     def _add_row():
         df = schedule_state().copy()
         df.loc[len(df)] = _default_row(len(df) + 1)
-        schedule_state.set(df)
+        schedule_state.set(_sort_schedule_by_investment_date(df))
 
     @reactive.effect
     @reactive.event(input.remove_last_row)
@@ -198,11 +248,31 @@ def server(input, output, session):
     @reactive.effect
     @reactive.event(input.reset_schedule)
     def _reset_schedule():
-        schedule_state.set(default_schedule())
+        schedule_state.set(_sort_schedule_by_investment_date(default_schedule()))
+
+    PCT_DISPLAY_COLUMNS = [
+        "spread",
+        "sofr_assumption",
+        "cash_interest_rate",
+        "pik_interest",
+        "amortization",
+        "oid",
+        "exit_fee",
+    ]
 
     @render.data_frame
     def schedule_df():
-        return render.DataGrid(schedule_state(), editable=True)
+        display_df = schedule_state().copy()
+        for col in PCT_DISPLAY_COLUMNS:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].apply(
+                    lambda v: f"{float(v) * 100:.2f}%" if v != "" and v is not None else v
+                )
+        if "loan_size" in display_df.columns:
+            display_df["loan_size"] = display_df["loan_size"].apply(
+                lambda v: f"{float(v):,.0f}" if v != "" and v is not None else v
+            )
+        return render.DataGrid(display_df, editable=True)
 
     @schedule_df.set_patches_fn
     def _patch_schedule(*, patches: list[render.CellPatch]) -> list[render.CellPatch]:
@@ -325,49 +395,29 @@ def server(input, output, session):
         return fig
 
     @render_widget
-    def interest_principal_chart():
+    def portfolio_irr_chart():
         try:
-            _, funds_df = portfolio_results()
+            portfolio_df, _ = portfolio_results()
         except Exception as exc:
             return _empty_figure(str(exc))
 
-        grouped = (
-            funds_df.groupby("quarter_end", as_index=False)
-            .agg(
-                {
-                    "cash_interest": "sum",
-                    "amortization": "sum",
-                    "remaining_balance_payment": "sum",
-                }
-            )
-            .sort_values("quarter_end")
-        )
-        grouped["principal_component"] = (
-            grouped["amortization"] + grouped["remaining_balance_payment"]
-        )
+        irr_series = _clean_series(portfolio_df["irr"])
+        irr_df = portfolio_df[["quarter_end"]].copy()
+        irr_df["irr"] = irr_series
+        irr_df = irr_df.dropna(subset=["irr"])
 
         fig = go.Figure()
         fig.add_trace(
-            go.Bar(
-                x=grouped["quarter_end"],
-                y=grouped["cash_interest"],
-                name="Interest",
+            go.Scatter(
+                x=irr_df["quarter_end"],
+                y=irr_df["irr"],
+                mode="lines+markers",
+                name="Portfolio IRR",
             )
         )
-        fig.add_trace(
-            go.Bar(
-                x=grouped["quarter_end"],
-                y=grouped["principal_component"],
-                name="Principal",
-            )
-        )
-        fig.update_layout(
-            barmode="stack",
-            title="Interest vs Principal",
-            template="plotly_white",
-        )
+        fig.update_layout(title="Portfolio IRR Over Time", template="plotly_white")
         fig.update_xaxes(title="Quarter End")
-        fig.update_yaxes(title="Cash Amount")
+        fig.update_yaxes(title="IRR", tickformat=".2%")
         return fig
 
     @render.table
