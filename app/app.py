@@ -187,7 +187,7 @@ def _empty_figure(message: str) -> go.Figure:
     )
     fig.update_xaxes(visible=False)
     fig.update_yaxes(visible=False)
-    fig.update_layout(template="plotly_white", margin={"l": 20, "r": 20, "t": 30, "b": 20})
+    fig.update_layout(template="plotly_dark", paper_bgcolor="#1f2937", plot_bgcolor="#1f2937", margin={"l": 20, "r": 20, "t": 30, "b": 20})
     return fig
 
 
@@ -223,13 +223,15 @@ app_ui = ui.page_navbar(
         ui.tags.style(
             ui.HTML("""
             .navbar {
-                background-color: #333333 !important;
+                background-color: #1f2937 !important;
                 position: sticky !important;
                 top: 0;
                 z-index: 1030;
             }
             body {
                 padding-top: 0;
+                background-color: #111827 !important;
+                color: #f9fafb !important;
             }
             .navbar-brand {
                 color: #ffffff !important;
@@ -276,7 +278,7 @@ app_ui = ui.page_navbar(
             #schedule_df table tbody td,
             #schedule_df [role="gridcell"] {
                 font-size: 0.8rem !important;
-                color: #495057 !important;
+                color: #d1d5db !important;
             }
             #schedule_df table thead th:nth-child(2),
             #schedule_df table thead th:nth-child(3),
@@ -331,7 +333,7 @@ app_ui = ui.page_navbar(
             #funds_summary_table table tbody td,
             #funds_summary_table [role="gridcell"] {
                 font-size: 0.8rem !important;
-                color: #495057 !important;
+                color: #d1d5db !important;
             }
             #portfolio_outputs_table table thead th,
             #portfolio_outputs_table [role="columnheader"] {
@@ -345,7 +347,7 @@ app_ui = ui.page_navbar(
             #portfolio_outputs_table table tbody td,
             #portfolio_outputs_table [role="gridcell"] {
                 font-size: 0.8rem !important;
-                color: #495057 !important;
+                color: #d1d5db !important;
                 white-space: nowrap !important;
                 width: max-content !important;
                 min-width: max-content !important;
@@ -414,6 +416,96 @@ app_ui = ui.page_navbar(
                 font-size: 0.72rem !important;
                 color: #9ca3af !important;
             }
+
+            /* === DARK MODE === */
+            .bslib-page-navbar, .tab-content, .tab-pane {
+                background-color: #111827 !important;
+            }
+            .bslib-sidebar-layout > .sidebar, .sidebar {
+                background-color: #1f2937 !important;
+                border-color: #374151 !important;
+            }
+            .bslib-sidebar-layout > .main {
+                background-color: #111827 !important;
+            }
+            .card, .bslib-card, .card-body {
+                background-color: #1f2937 !important;
+                border-color: #374151 !important;
+                color: #f9fafb !important;
+            }
+            label, .control-label, p, h1, h2, h3, h4, h5, h6 {
+                color: #f9fafb !important;
+            }
+            .form-control, .form-select, select,
+            input[type="text"], input[type="number"], input[type="date"] {
+                background-color: #374151 !important;
+                color: #f9fafb !important;
+                border-color: #4b5563 !important;
+            }
+            .form-control:focus, .form-select:focus {
+                background-color: #374151 !important;
+                color: #f9fafb !important;
+                border-color: #6b7280 !important;
+                box-shadow: 0 0 0 0.2rem rgba(107,114,128,0.25) !important;
+            }
+            .btn {
+                background-color: #374151 !important;
+                border-color: #4b5563 !important;
+                color: #f9fafb !important;
+            }
+            .btn:hover {
+                background-color: #4b5563 !important;
+                border-color: #6b7280 !important;
+                color: #ffffff !important;
+            }
+            .irs--shiny .irs-line {
+                background-color: #374151 !important;
+                border-color: #374151 !important;
+            }
+            .irs--shiny .irs-bar {
+                background-color: #4b5563 !important;
+            }
+            .irs--shiny .irs-handle {
+                background: #9ca3af !important;
+                border-color: #6b7280 !important;
+            }
+            .irs--shiny .irs-min, .irs--shiny .irs-max,
+            .irs--shiny .irs-from, .irs--shiny .irs-to,
+            .irs--shiny .irs-single {
+                background-color: #4b5563 !important;
+                color: #f9fafb !important;
+            }
+            .selectize-input, .selectize-dropdown {
+                background-color: #374151 !important;
+                color: #f9fafb !important;
+                border-color: #4b5563 !important;
+            }
+            .selectize-dropdown .option:hover,
+            .selectize-dropdown .option.active {
+                background-color: #4b5563 !important;
+                color: #ffffff !important;
+            }
+            #schedule_df table tbody tr,
+            #schedule_df [role="row"],
+            #portfolio_outputs_table table tbody tr,
+            #portfolio_outputs_table [role="row"],
+            #funds_summary_table table tbody tr,
+            #funds_summary_table [role="row"] {
+                background-color: #1f2937 !important;
+            }
+            #schedule_df table tbody tr:nth-child(even),
+            #portfolio_outputs_table table tbody tr:nth-child(even),
+            #funds_summary_table table tbody tr:nth-child(even) {
+                background-color: #253347 !important;
+            }
+            #schedule_df table, #portfolio_outputs_table table, #funds_summary_table table {
+                border-color: #374151 !important;
+            }
+            #schedule_df table td, #schedule_df table th,
+            #portfolio_outputs_table table td, #portfolio_outputs_table table th,
+            #funds_summary_table table td, #funds_summary_table table th {
+                border-color: #374151 !important;
+            }
             """)
         )
     ),
@@ -426,7 +518,7 @@ app_ui = ui.page_navbar(
                 ui.input_action_button("reset_schedule", "Reset defaults"),
             ),
             ui.p(
-                "Edit all rows/columns directly. Changes feed the portfolio outputs page.",
+                "Schedule of Investments. Click 'Add investment' to add rows to the schedule. Select rows and click 'Remove investment' to delete them. Click 'Reset defaults' to restore the original sample schedule.",
             ),
             ui.div(
                 {"style": "width: fit-content; margin-left: auto; margin-right: auto;"},
@@ -464,7 +556,7 @@ app_ui = ui.page_navbar(
             ui.layout_columns(
                 output_widget("cashflow_combined_chart"),
                 output_widget("remaining_balance_chart"),
-                col_widths=(8, 4),
+                col_widths=(6, 6),
             ),
             ui.layout_columns(
                 output_widget("tvpi_chart"),
@@ -690,9 +782,12 @@ def server(input, output, session):
             )
         )
         fig.update_layout(
-            title="Cash Flow and Cumulative Cash Flow",
-            template="plotly_white",
+            title=dict(text="Cash Flow", y=0.95, yanchor="top"),
+            template="plotly_dark",
+            paper_bgcolor="#1f2937",
+            plot_bgcolor="#1f2937",
             legend={"orientation": "h", "y": 1.05, "x": 0},
+            margin={"l": 20, "r": 20, "t": 80, "b": 20},
         )
         fig.update_xaxes(title="Quarter End")
         fig.update_yaxes(title_text="Cash Flow")
@@ -716,7 +811,7 @@ def server(input, output, session):
                 marker={"color": LINE_BLUE, "size": 7},
             )
         )
-        fig.update_layout(title="Remaining Balance", template="plotly_white")
+        fig.update_layout(title=dict(text="Remaining Balance", y=0.95, yanchor="top"), template="plotly_dark", paper_bgcolor="#1f2937", plot_bgcolor="#1f2937", margin={"l": 20, "r": 20, "t": 80, "b": 20})
         fig.update_xaxes(title="Quarter End")
         fig.update_yaxes(title="Balance")
         return fig
@@ -744,7 +839,7 @@ def server(input, output, session):
                 marker={"color": LINE_BLUE, "size": 7},
             )
         )
-        fig.update_layout(title="Portfolio Gross TVPI", template="plotly_white")
+        fig.update_layout(title=dict(text="Portfolio Gross TVPI", y=0.95, yanchor="top"), template="plotly_dark", paper_bgcolor="#1f2937", plot_bgcolor="#1f2937", margin={"l": 20, "r": 20, "t": 80, "b": 20})
         fig.update_xaxes(title="Quarter End")
         fig.update_yaxes(title="TVPI", tickformat=".2f")
         return fig
@@ -772,7 +867,7 @@ def server(input, output, session):
                 marker={"color": LINE_BLUE, "size": 7},
             )
         )
-        fig.update_layout(title="Portfolio Gross IRR", template="plotly_white")
+        fig.update_layout(title=dict(text="Portfolio Gross IRR", y=0.95, yanchor="top"), template="plotly_dark", paper_bgcolor="#1f2937", plot_bgcolor="#1f2937", margin={"l": 20, "r": 20, "t": 80, "b": 20})
         fig.update_xaxes(title="Quarter End")
         fig.update_yaxes(title="IRR", tickformat=".2%")
         return fig
