@@ -40,6 +40,14 @@ def _irr_quarterly(cashflows, tolerance=1e-10, max_iterations=200):
 
     return (low + high) / 2
 
+
+def _format_irr(quarterly_irr, cumulative_quarters):
+    if quarterly_irr is None:
+        return None
+    if cumulative_quarters < 4:
+        return quarterly_irr
+    return ((1 + quarterly_irr) ** 4) - 1
+
 def _get_periodicity_config(periodicity):
     period_map = {
         "annual": (1, 12),
@@ -347,10 +355,7 @@ def private_credit_loan_model(
         cumulative_cashflows = adjusted_payments[: idx + 1]
         cumulative_cashflows.append(ending_balances[idx])
         quarterly_irr = _irr_quarterly(cumulative_cashflows)
-        if quarterly_irr is None:
-            irr_values.append(None)
-        else:
-            irr_values.append(((1 + quarterly_irr) ** 4) - 1)
+        irr_values.append(_format_irr(quarterly_irr, idx + 1))
 
     loan_df["irr"] = irr_values
     loan_df.at[0, "irr"] = None
@@ -436,13 +441,56 @@ def loan_portfolio(schedule_of_investments):
     ).reset_index()
 
     portfolio_df['irr'] = None
+    paid_in_capital = (-portfolio_df["total_payment"].clip(upper=0)).cumsum()
+    cumulative_distributions = portfolio_df["total_payment"].clip(lower=0).cumsum()
+    portfolio_df["tvpi"] = (
+        (cumulative_distributions + portfolio_df["ending_balance"])
+        / paid_in_capital.where(paid_in_capital != 0)
+    )
 
     for i in range(1, len(portfolio_df)):
         # i = 5
         quarter_date = portfolio_df.at[i, "quarter_end"]
-        cfs = portfolio_df[portfolio_df["quarter_end"] <= quarter_date]
+        cfs = portfolio_df[portfolio_df["quarter_end"] <= quarter_date].copy()
         cfs['irr_cfs'] = cfs['total_payment']
         cfs.at[i, 'irr_cfs'] = cfs.at[i, 'irr_cfs'] - cfs.at[i, 'remaining_balance_payment'] + cfs.at[i, 'ending_balance']
-        portfolio_df.at[i, 'irr'] = (1 + _irr_quarterly(cfs['irr_cfs'].tolist()))**4 - 1
+        quarterly_irr = _irr_quarterly(cfs['irr_cfs'].tolist())
+        portfolio_df.at[i, 'irr'] = _format_irr(quarterly_irr, i)
 
-    return portfolio_df, funds_df
+    funds_summary_df = (
+        funds_df
+        .sort_values(["investment_name", "quarter_end"], kind="stable")
+        .groupby("investment_name", as_index=False)
+        .agg(
+            total_payment=("total_payment", "sum"),
+            irr=("irr", "last"),
+        )
+    )
+
+    schedule_summary_columns = [
+        "investment_name",
+        "investment_date",
+        "maturity_date",
+        "loan_size",
+        "spread",
+        "base_rate",
+        "sofr_assumption",
+        "cash_interest_rate",
+        "pik_interest",
+        "amortization",
+        "oid",
+        "exit_fee",
+        "prepayment_date",
+    ]
+    schedule_summary_df = (
+        schedule_of_investments[schedule_summary_columns]
+        .drop_duplicates(subset=["investment_name"])
+        .copy()
+    )
+    funds_summary_df = schedule_summary_df.merge(
+        funds_summary_df,
+        on="investment_name",
+        how="left",
+    )
+
+    return portfolio_df, funds_df, funds_summary_df
