@@ -195,18 +195,53 @@ def _clean_series(series: pd.Series) -> pd.Series:
 
 
 app_ui = ui.page_navbar(
+    ui.head_content(
+        ui.tags.style(
+            ui.HTML("""
+            .navbar {
+                background-color: #333333 !important;
+            }
+            .navbar-brand {
+                color: #ffffff !important;
+            }
+            .navbar-dark .navbar-brand {
+                color: #ffffff !important;
+            }
+            .navbar-dark .navbar-text {
+                color: #ffffff !important;
+            }
+            .navbar-dark .navbar-nav .nav-link {
+                color: #ffffff !important;
+            }
+            .navbar-dark .navbar-nav .nav-link.active {
+                color: #ffffff !important;
+            }
+            .navbar-dark .navbar-nav .nav-link:hover {
+                color: #e0e0e0 !important;
+            }
+            .nav-link {
+                color: #ffffff !important;
+            }
+            .navbar-title {
+                color: #ffffff !important;
+            }
+            """)
+        )
+    ),
     ui.nav_panel(
         "Loan Schedule",
-        ui.p(
-            "Edit all rows/columns directly. Changes feed the portfolio outputs page.",
+        ui.layout_sidebar(
+            ui.sidebar(
+                ui.input_action_button("add_row", "Add investment"),
+                ui.input_action_button("remove_selected_rows", "Remove investment"),
+                ui.input_action_button("reset_schedule", "Reset defaults"),
+            ),
+            ui.p(
+                "Edit all rows/columns directly. Changes feed the portfolio outputs page.",
+            ),
+            ui.output_data_frame("schedule_df"),
+            ui.output_ui("schedule_error"),
         ),
-        ui.layout_columns(
-            ui.input_action_button("add_row", "Add row"),
-            ui.input_action_button("remove_last_row", "Remove last row"),
-            ui.input_action_button("reset_schedule", "Reset defaults"),
-        ),
-        ui.output_data_frame("schedule_df"),
-        ui.output_ui("schedule_error"),
     ),
     ui.nav_panel(
         "Portfolio Outputs",
@@ -224,7 +259,7 @@ app_ui = ui.page_navbar(
         ui.h4("IRR Summary"),
         ui.output_table("irr_summary"),
     ),
-    title="Private Credit Portfolio App",
+    title="MMC Capital"
 )
 
 
@@ -237,13 +272,6 @@ def server(input, output, session):
         df = schedule_state().copy()
         df.loc[len(df)] = _default_row(len(df) + 1)
         schedule_state.set(_sort_schedule_by_investment_date(df))
-
-    @reactive.effect
-    @reactive.event(input.remove_last_row)
-    def _remove_last_row():
-        df = schedule_state().copy()
-        if len(df) > 1:
-            schedule_state.set(df.iloc[:-1].reset_index(drop=True))
 
     @reactive.effect
     @reactive.event(input.reset_schedule)
@@ -272,7 +300,7 @@ def server(input, output, session):
             display_df["loan_size"] = display_df["loan_size"].apply(
                 lambda v: f"{float(v):,.0f}" if v != "" and v is not None else v
             )
-        return render.DataGrid(display_df, editable=True)
+        return render.DataGrid(display_df, editable=True, selection_mode="rows")
 
     @schedule_df.set_patches_fn
     def _patch_schedule(*, patches: list[render.CellPatch]) -> list[render.CellPatch]:
@@ -297,6 +325,16 @@ def server(input, output, session):
                 df.iat[row_index, column_index] = new_value
         schedule_state.set(df)
         return patches
+
+    @reactive.effect
+    @reactive.event(input.remove_selected_rows)
+    def _remove_selected_rows():
+        df = schedule_state().copy()
+        selected_rows = schedule_df.cell_selection()["rows"]
+        if selected_rows:
+            df = df.drop(index=list(selected_rows)).reset_index(drop=True)
+            if len(df) > 0:
+                schedule_state.set(df)
 
     @reactive.calc
     def portfolio_results():
