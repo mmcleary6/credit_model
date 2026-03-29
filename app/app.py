@@ -220,6 +220,7 @@ def _format_table_headers(df: pd.DataFrame) -> pd.DataFrame:
 
 app_ui = ui.page_navbar(
     ui.head_content(
+        ui.tags.link(rel="icon", type="image/svg+xml", href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><rect fill='%232563eb' width='100' height='100'/><text x='50' y='70' font-size='50' font-weight='bold' fill='white' text-anchor='middle' font-family='monospace'>mmc</text></svg>"),
         ui.tags.style(
             ui.HTML("""
             .navbar {
@@ -586,7 +587,8 @@ app_ui = ui.page_navbar(
             ),
         ),
     ),
-    title="MMC Capital"
+    title=ui.tags.img(src="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 350 100'><defs><linearGradient id='textGrad' x1='0%' y1='0%' x2='0%' y2='100%'><stop offset='0%' style='stop-color:%23d1d5db;stop-opacity:1' /><stop offset='100%' style='stop-color:%23ffffff;stop-opacity:1' /></linearGradient></defs><rect fill='%232563eb' width='350' height='100'/><polygon points='0,80 40,40 80,60 120,30 160,50 200,20 240,45 280,35 320,55 350,40 350,100 0,100' fill='%231e3a8a' opacity='0.7'/><polyline points='0,80 40,40 80,60 120,30 160,50 200,20 240,45 280,35 320,55 350,40 350,100 0,100' stroke='black' stroke-width='1.5' fill='none'/><polyline points='20,90 60,50 100,75 140,45 180,65 220,35 260,60 300,50 330,70 350,60 350,100 20,100' stroke='black' stroke-width='1' fill='none' opacity='0.6'/><text x='175' y='70' font-size='48' font-weight='700' font-stretch='condensed' fill='url(%23textGrad)' stroke='black' stroke-width='1' text-anchor='middle' font-family='Arial'>MMC Capital</text></svg>", style="height: 40px; width: auto;"),
+    window_title="Portfolio Analytics"
 )
 
 
