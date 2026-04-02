@@ -6,13 +6,12 @@ This module fetches Secured Overnight Financing Rate observations from FRED and
 returns them in a format that can be consumed by the private credit model.
 """
 
-import os
 import requests
 import pandas as pd
 
 # fred_api_key = os.getenv("FRED_API_KEY")
 
-def get_sofr_data(api_key, frequency='D'):
+def get_sofr_data(api_key, frequency='D', end_date=None):
     """Fetch SOFR observations from the FRED API.
 
     Parameters
@@ -22,18 +21,24 @@ def get_sofr_data(api_key, frequency='D'):
     frequency : {'D', 'M', 'Q', 'Y'}, default='D'
         Output frequency. Daily returns all observations. Monthly, quarterly,
         and yearly outputs are filtered to period-end observations.
+    end_date : str or pandas.Timestamp or None, default=None
+        Optional date used to extend the returned series beyond the latest FRED
+        observation. If provided and later than the maximum available SOFR
+        date, the function appends daily rows through ``end_date`` and rolls
+        forward the most recent SOFR value.
 
     Returns
     -------
     pandas.DataFrame
-        DataFrame with ``date`` and ``sofr`` columns, where ``sofr`` is stored
-        as a decimal rather than a percentage.
+        DataFrame with ``date``, ``sofr``, and ``rate_status`` columns, where
+        ``sofr`` is stored as a decimal rather than a percentage and
+        ``rate_status`` is either ``"actual"`` or ``"assumed"``.
 
     Raises
     ------
     ValueError
         Raised when ``frequency`` is not one of ``'D'``, ``'M'``, ``'Q'``, or
-        ``'Y'``.
+        ``'Y'``, or when ``end_date`` cannot be parsed as a valid date.
 
     Notes
     -----
@@ -41,14 +46,20 @@ def get_sofr_data(api_key, frequency='D'):
     by ``100`` so downstream modeling uses decimal rates.
     """
 
-    # api_key = fred_api_key  # Use the API key from the environment variable
+    if not api_key:
+        raise ValueError("FRED_API_KEY is required to fetch SOFR data")
 
     # Fred API endpoint for SOFR data
     fred_api_url = f"https://api.stlouisfed.org/fred/series/observations?series_id=SOFR&api_key={api_key}&file_type=json"
     
     # Fetch the data from the FRED API
-    response = requests.get(fred_api_url)
+    response = requests.get(fred_api_url, timeout=30)
+    response.raise_for_status()
     data = response.json()
+
+    if 'observations' not in data:
+        error_message = data.get('error_message') or data.get('message') or 'FRED response did not include observations'
+        raise ValueError(f"Unable to load SOFR data: {error_message}")
     
     # Extract the observations from the data
     observations = data['observations']
@@ -64,6 +75,34 @@ def get_sofr_data(api_key, frequency='D'):
 
     # Convert the 'value' column to numeric, coercing errors to NaN (in case there are any non-numeric values)
     sofr_df['value'] = pd.to_numeric(sofr_df['value'], errors='coerce')
+
+    sofr_df['rate_status'] = 'actual'
+
+    if end_date is not None:
+        try:
+            normalized_end_date = pd.Timestamp(end_date).normalize()
+        except (TypeError, ValueError) as exc:
+            raise ValueError("end_date must be a valid date") from exc
+
+        max_date = sofr_df['date'].max()
+        if pd.notna(max_date):
+            max_date = pd.Timestamp(max_date).normalize()
+            if normalized_end_date > max_date:
+                future_dates = pd.date_range(
+                    start=max_date + pd.Timedelta(days=1),
+                    end=normalized_end_date,
+                    freq='D',
+                )
+                if len(future_dates) > 0:
+                    latest_sofr = sofr_df.loc[sofr_df['date'] == max_date, 'value'].iloc[-1]
+                    assumed_rows = pd.DataFrame(
+                        {
+                            'date': future_dates,
+                            'value': latest_sofr,
+                            'rate_status': 'assumed',
+                        }
+                    )
+                    sofr_df = pd.concat([sofr_df, assumed_rows], ignore_index=True)
 
     # Create a boolean column for dates that are the last day of the month
     sofr_df['is_month_end'] = sofr_df['date'].dt.is_month_end
@@ -82,12 +121,12 @@ def get_sofr_data(api_key, frequency='D'):
     sofr_df['sofr'] = sofr_df['sofr'] / 100  # Convert from percentage to decimal
 
     if frequency == 'D':
-        return sofr_df[['date', 'sofr']].reset_index(drop=True)
+        return sofr_df[['date', 'sofr', 'rate_status']].reset_index(drop=True)
     elif frequency == 'M':
-        return sofr_df[sofr_df['is_month_end']][['date', 's']].reset_index(drop=True)
+        return sofr_df[sofr_df['is_month_end']][['date', 'sofr', 'rate_status']].reset_index(drop=True)
     elif frequency == 'Q':
-        return sofr_df[sofr_df['is_quarter_end']][['date', 'sofr']].reset_index(drop=True)
+        return sofr_df[sofr_df['is_quarter_end']][['date', 'sofr', 'rate_status']].reset_index(drop=True)
     elif frequency == 'Y':
-        return sofr_df[sofr_df['is_year_end']][['date', 'sofr']].reset_index(drop=True)
+        return sofr_df[sofr_df['is_year_end']][['date', 'sofr', 'rate_status']].reset_index(drop=True)
     else:
         raise ValueError("Invalid frequency. Please choose from 'D', 'M', 'Q', or 'Y'.")

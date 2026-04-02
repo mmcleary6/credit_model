@@ -43,7 +43,9 @@ NUMERIC_COLUMNS = [
 ]
 
 LINE_BLUE = "#2563eb"
+LIGHT_BLUE = "#7dd3fc"
 FRED_API_KEY = os.getenv("FRED_API_KEY")
+SOFR_RATES = pd.DataFrame()
 
 
 def _default_row(index: int) -> dict:
@@ -156,9 +158,166 @@ def _schedule_uses_actual_sofr(df: pd.DataFrame) -> bool:
     ).any()
 
 
+def _first_assumed_sofr_date(sofr_df: pd.DataFrame) -> str | None:
+    if sofr_df.empty or "date" not in sofr_df.columns or "rate_status" not in sofr_df.columns:
+        return None
+
+    working_df = sofr_df.copy()
+    working_df["date"] = pd.to_datetime(working_df["date"], errors="coerce")
+    assumed_dates = working_df.loc[
+        working_df["rate_status"].astype(str).str.lower() == "assumed",
+        "date",
+    ].dropna()
+
+    if assumed_dates.empty:
+        return None
+
+    return assumed_dates.min().strftime("%Y-%m-%d")
+
+
+def _apply_rate_shock_to_assumed_sofr(
+    sofr_df: pd.DataFrame,
+    rate_shock_bps: int | float,
+    shock_start_date: object | None,
+) -> pd.DataFrame:
+    if sofr_df.empty or "sofr" not in sofr_df.columns or "rate_status" not in sofr_df.columns:
+        return sofr_df
+
+    if not rate_shock_bps:
+        return sofr_df
+
+    shocked_df = sofr_df.copy()
+    shocked_df["date"] = pd.to_datetime(shocked_df["date"], errors="coerce")
+    shocked_df["sofr"] = pd.to_numeric(shocked_df["sofr"], errors="coerce")
+    assumed_mask = shocked_df["rate_status"].astype(str).str.lower() == "assumed"
+
+    if shock_start_date is not None:
+        shock_start_timestamp = pd.Timestamp(shock_start_date)
+        assumed_mask = assumed_mask & (shocked_df["date"] >= shock_start_timestamp)
+
+    shocked_df.loc[assumed_mask, "sofr"] = (
+        shocked_df.loc[assumed_mask, "sofr"] + (float(rate_shock_bps) / 10_000.0)
+    )
+    return shocked_df
+
+
+def _apply_rate_shock_to_schedule(
+    schedule_df: pd.DataFrame,
+    rate_shock_bps: int | float,
+    shock_start_date: object | None,
+) -> pd.DataFrame:
+    if schedule_df.empty or "sofr_assumption" not in schedule_df.columns:
+        return schedule_df
+
+    if not rate_shock_bps:
+        return schedule_df
+
+    shocked_schedule = schedule_df.copy()
+    shock_decimal = float(rate_shock_bps) / 10_000.0
+    numeric_mask = shocked_schedule["sofr_assumption"].apply(
+        lambda value: not (isinstance(value, str) and value.lower() == "actual")
+    )
+
+    if shock_start_date is not None and "maturity_date" in shocked_schedule.columns:
+        shock_start_timestamp = pd.Timestamp(shock_start_date)
+        numeric_mask = numeric_mask & (
+            pd.to_datetime(shocked_schedule["maturity_date"], errors="coerce")
+            >= shock_start_timestamp
+        )
+
+    shocked_schedule.loc[numeric_mask, "sofr_assumption"] = (
+        pd.to_numeric(shocked_schedule.loc[numeric_mask, "sofr_assumption"], errors="coerce")
+        + shock_decimal
+    )
+    return shocked_schedule
+
+
+def _build_linear_rate_change_factors(
+    date_series: pd.Series,
+    change_start_date: object | None,
+) -> pd.Series:
+    working_dates = pd.to_datetime(date_series, errors="coerce")
+    factors = pd.Series(0.0, index=date_series.index, dtype=float)
+
+    valid_dates = working_dates.dropna()
+    if valid_dates.empty:
+        return factors
+
+    if change_start_date is None:
+        start_timestamp = valid_dates.min()
+    else:
+        start_timestamp = pd.Timestamp(change_start_date)
+
+    eligible_mask = working_dates >= start_timestamp
+    eligible_dates = working_dates.loc[eligible_mask].dropna()
+    if eligible_dates.empty:
+        return factors
+
+    end_timestamp = eligible_dates.max()
+    total_days = (end_timestamp - start_timestamp).days
+
+    if total_days <= 0:
+        factors.loc[eligible_mask] = 1.0
+        return factors
+
+    factors.loc[eligible_mask] = (
+        (working_dates.loc[eligible_mask] - start_timestamp).dt.days / total_days
+    ).clip(lower=0.0, upper=1.0)
+    return factors
+
+
+def _apply_linear_rate_change_to_assumed_sofr(
+    sofr_df: pd.DataFrame,
+    rate_change_bps: int | float,
+    change_start_date: object | None,
+) -> pd.DataFrame:
+    if sofr_df.empty or "sofr" not in sofr_df.columns or "rate_status" not in sofr_df.columns:
+        return sofr_df
+
+    if not rate_change_bps:
+        return sofr_df
+
+    changed_df = sofr_df.copy()
+    changed_df["date"] = pd.to_datetime(changed_df["date"], errors="coerce")
+    changed_df["sofr"] = pd.to_numeric(changed_df["sofr"], errors="coerce")
+    assumed_mask = changed_df["rate_status"].astype(str).str.lower() == "assumed"
+    assumed_dates = changed_df.loc[assumed_mask, "date"]
+    factors = _build_linear_rate_change_factors(assumed_dates, change_start_date)
+    delta = (float(rate_change_bps) / 10_000.0) * factors
+    changed_df.loc[assumed_mask, "sofr"] = (
+        changed_df.loc[assumed_mask, "sofr"] + delta
+    )
+    return changed_df
+
+
+def _apply_linear_rate_change_to_schedule(
+    schedule_df: pd.DataFrame,
+    rate_change_bps: int | float,
+    change_start_date: object | None,
+) -> pd.DataFrame:
+    if schedule_df.empty or "sofr_assumption" not in schedule_df.columns:
+        return schedule_df
+
+    if not rate_change_bps:
+        return schedule_df
+
+    changed_schedule = schedule_df.copy()
+    numeric_mask = changed_schedule["sofr_assumption"].apply(
+        lambda value: not (isinstance(value, str) and value.lower() == "actual")
+    )
+    maturity_dates = pd.to_datetime(changed_schedule.loc[numeric_mask, "maturity_date"], errors="coerce")
+    factors = _build_linear_rate_change_factors(maturity_dates, change_start_date)
+    delta = (float(rate_change_bps) / 10_000.0) * factors
+    changed_schedule.loc[numeric_mask, "sofr_assumption"] = (
+        pd.to_numeric(changed_schedule.loc[numeric_mask, "sofr_assumption"], errors="coerce")
+        + delta
+    )
+    return changed_schedule
+
+
 @lru_cache(maxsize=1)
-def _get_daily_sofr_history(api_key: str) -> pd.DataFrame:
-    return get_sofr_data(api_key=api_key, frequency="D")
+def _get_daily_sofr_history(api_key: str, end_date: str) -> pd.DataFrame:
+    return get_sofr_data(api_key=api_key, frequency="D", end_date=end_date)
 
 
 def _coerce_schedule(df: pd.DataFrame) -> pd.DataFrame:
@@ -236,7 +395,7 @@ def _clean_series(series: pd.Series) -> pd.Series:
 
 def _format_column_label(column_name: str) -> str:
     if str(column_name).lower() == "sofr_assumption":
-        return "SOFR Assumption"
+        return "SOFR"
 
     replacements = {
         "irr": "IRR",
@@ -575,26 +734,69 @@ app_ui = ui.page_navbar(
         ui.layout_sidebar(
             ui.sidebar(
                 ui.h4("Scenario Analysis"),
-                ui.p("Placeholder: scenario controls will be added here."),
-                ui.input_select(
-                    "scenario_type",
-                    "Scenario",
-                    choices=["Base Case (Placeholder)", "Downside (Placeholder)", "Upside (Placeholder)"],
-                    selected="Base Case (Placeholder)",
+                ui.div(
+                    {
+                        "style": "border: 1px solid #374151; border-radius: 8px; padding: 12px; margin-bottom: 12px; font-size: 0.85rem;",
+                    },
+                    ui.h5(
+                        "Rate Shock",
+                        style="margin-top: 0; margin-bottom: 12px; font-size: 0.95rem; font-weight: 700; text-align: center;",
+                    ),
+                    ui.div(
+                        {"style": "font-size: 0.75rem;"},
+                        ui.input_date(
+                            "rate_shock_start_date",
+                            "Start Date",
+                            value=None,
+                        ),
+                    ),
+                    ui.input_slider(
+                        "scenario_shift",
+                        "bps",
+                        min=-300,
+                        max=300,
+                        value=0,
+                        step=25,
+                    ),
+                    ui.div(
+                        {"style": "font-size: 0.75rem;"},
+                        ui.input_action_button("run_rate_shock", "Run Rate Shock"),
+                    ),
                 ),
-                ui.input_slider(
-                    "scenario_shift",
-                    "Rate Shock (Placeholder, bps)",
-                    min=-300,
-                    max=300,
-                    value=0,
-                    step=25,
+                ui.div(
+                    {
+                        "style": "border: 1px solid #374151; border-radius: 8px; padding: 12px; margin-bottom: 12px; font-size: 0.85rem;",
+                    },
+                    ui.h5(
+                        "Rate Change",
+                        style="margin-top: 0; margin-bottom: 12px; font-size: 0.95rem; font-weight: 700; text-align: center;",
+                    ),
+                    ui.div(
+                        {"style": "font-size: 0.75rem;"},
+                        ui.input_date(
+                            "rate_change_start_date",
+                            "Start Date",
+                            value=None,
+                        ),
+                    ),
+                    ui.input_slider(
+                        "rate_change_bps",
+                        "bps",
+                        min=-300,
+                        max=300,
+                        value=0,
+                        step=25,
+                    ),
+                    ui.div(
+                        {"style": "font-size: 0.75rem;"},
+                        ui.input_action_button("run_rate_change", "Run Rate Change"),
+                    ),
                 ),
             ),
             ui.output_ui("portfolio_error"),
             ui.layout_columns(
                 output_widget("cashflow_combined_chart"),
-                output_widget("remaining_balance_chart"),
+                output_widget("sofr_rate_chart"),
                 col_widths=(6, 6),
             ),
             ui.layout_columns(
@@ -632,6 +834,12 @@ app_ui = ui.page_navbar(
 
 def server(input, output, session):
     schedule_state = reactive.value(_sort_schedule_by_investment_date(default_schedule()))
+    rate_shock_start_date_default = reactive.value(None)
+    rate_change_start_date_default = reactive.value(None)
+    applied_rate_shock_bps = reactive.value(0)
+    applied_rate_shock_start_date = reactive.value(None)
+    applied_rate_change_bps = reactive.value(0)
+    applied_rate_change_start_date = reactive.value(None)
 
     @reactive.effect
     @reactive.event(input.add_row)
@@ -679,7 +887,7 @@ def server(input, output, session):
             "Par Value",
             "Spread",
             "Base Rate",
-            "SOFR Assumption",
+            "SOFR",
             "PIK Interest",
             "Amortization",
             "OID",
@@ -760,16 +968,53 @@ def server(input, output, session):
 
     @reactive.calc
     def portfolio_results():
+        global SOFR_RATES
+
         normalized_schedule = _coerce_schedule(schedule_state())
+        max_maturity_date = normalized_schedule["maturity_date"].max()
+        rate_shock_bps = applied_rate_shock_bps()
+        shock_start_date = applied_rate_shock_start_date()
+        rate_change_bps = applied_rate_change_bps()
+        change_start_date = applied_rate_change_start_date()
+
+        if FRED_API_KEY:
+            SOFR_RATES = _get_daily_sofr_history(
+                FRED_API_KEY,
+                pd.Timestamp(max_maturity_date).strftime("%Y-%m-%d"),
+            ).copy()
+            SOFR_RATES = _apply_rate_shock_to_assumed_sofr(
+                SOFR_RATES,
+                rate_shock_bps,
+                shock_start_date,
+            )
+            SOFR_RATES = _apply_linear_rate_change_to_assumed_sofr(
+                SOFR_RATES,
+                rate_change_bps,
+                change_start_date,
+            )
+        else:
+            SOFR_RATES = pd.DataFrame()
+
+        shocked_schedule = _apply_rate_shock_to_schedule(
+            normalized_schedule,
+            rate_shock_bps,
+            shock_start_date,
+        )
+        shocked_schedule = _apply_linear_rate_change_to_schedule(
+            shocked_schedule,
+            rate_change_bps,
+            change_start_date,
+        )
+
         sofr_rates = None
-        if _schedule_uses_actual_sofr(normalized_schedule):
+        if _schedule_uses_actual_sofr(shocked_schedule):
             if not FRED_API_KEY:
                 raise ValueError(
                     "FRED_API_KEY is required when any loan uses sofr_assumption='actual'."
                 )
-            sofr_rates = _get_daily_sofr_history(FRED_API_KEY)
+            sofr_rates = SOFR_RATES.copy()
 
-        result = loan_portfolio(normalized_schedule, sofr_rates=sofr_rates)
+        result = loan_portfolio(shocked_schedule, sofr_rates=sofr_rates)
 
         if isinstance(result, tuple):
             if len(result) >= 3:
@@ -788,6 +1033,95 @@ def server(input, output, session):
             raise ValueError("Portfolio output is empty. Add valid schedule rows.")
 
         return portfolio_df, funds_df, funds_summary_df
+
+    @reactive.effect
+    def _initialize_portfolio_outputs():
+        schedule_state()
+        try:
+            portfolio_results()
+        except Exception:
+            return
+
+    @reactive.effect
+    def _set_default_rate_shock_start_date():
+        try:
+            normalized_schedule = _coerce_schedule(schedule_state())
+            max_maturity_date = normalized_schedule["maturity_date"].max()
+
+            if not FRED_API_KEY:
+                return
+
+            raw_sofr_rates = _get_daily_sofr_history(
+                FRED_API_KEY,
+                pd.Timestamp(max_maturity_date).strftime("%Y-%m-%d"),
+            )
+        except Exception:
+            return
+
+        default_start_date = _first_assumed_sofr_date(raw_sofr_rates)
+        current_value = input.rate_shock_start_date()
+        previous_default = rate_shock_start_date_default()
+        current_value_text = (
+            current_value.isoformat() if hasattr(current_value, "isoformat") else None
+        )
+
+        if default_start_date is None:
+            return
+
+        should_update = False
+        if current_value_text is None:
+            should_update = True
+        elif previous_default is not None and current_value_text == previous_default:
+            should_update = current_value_text != default_start_date
+
+        if should_update:
+            ui.update_date(
+                "rate_shock_start_date",
+                value=default_start_date,
+                session=session,
+            )
+
+        if previous_default != default_start_date:
+            rate_shock_start_date_default.set(default_start_date)
+
+        rate_change_current_value = input.rate_change_start_date()
+        rate_change_previous_default = rate_change_start_date_default()
+        rate_change_current_value_text = (
+            rate_change_current_value.isoformat()
+            if hasattr(rate_change_current_value, "isoformat")
+            else None
+        )
+
+        rate_change_should_update = False
+        if rate_change_current_value_text is None:
+            rate_change_should_update = True
+        elif (
+            rate_change_previous_default is not None
+            and rate_change_current_value_text == rate_change_previous_default
+        ):
+            rate_change_should_update = rate_change_current_value_text != default_start_date
+
+        if rate_change_should_update:
+            ui.update_date(
+                "rate_change_start_date",
+                value=default_start_date,
+                session=session,
+            )
+
+        if rate_change_previous_default != default_start_date:
+            rate_change_start_date_default.set(default_start_date)
+
+    @reactive.effect
+    @reactive.event(input.run_rate_shock)
+    def _run_rate_shock():
+        applied_rate_shock_bps.set(input.scenario_shift())
+        applied_rate_shock_start_date.set(input.rate_shock_start_date())
+
+    @reactive.effect
+    @reactive.event(input.run_rate_change)
+    def _run_rate_change():
+        applied_rate_change_bps.set(input.rate_change_bps())
+        applied_rate_change_start_date.set(input.rate_change_start_date())
 
     @render.ui
     def schedule_error():
@@ -839,8 +1173,18 @@ def server(input, output, session):
                 marker={"color": LINE_BLUE, "size": 7},
             )
         )
+        fig.add_trace(
+            go.Scatter(
+                x=portfolio_df["quarter_end"],
+                y=portfolio_df["ending_balance"],
+                mode="lines",
+                name="Remaining Balance",
+                line={"color": LIGHT_BLUE, "width": 2},
+                opacity=0.2,
+            )
+        )
         fig.update_layout(
-            title=dict(text="Cash Flow", y=0.95, yanchor="top"),
+            title=dict(text="Cash Flow and Remaining Balance", y=0.95, yanchor="top"),
             template="plotly_dark",
             paper_bgcolor="#1f2937",
             plot_bgcolor="#1f2937",
@@ -848,30 +1192,83 @@ def server(input, output, session):
             margin={"l": 20, "r": 20, "t": 80, "b": 20},
         )
         fig.update_xaxes(title="Quarter End")
-        fig.update_yaxes(title_text="Cash Flow")
+        fig.update_yaxes(title_text="Value")
         return fig
 
     @render_widget
-    def remaining_balance_chart():
+    def sofr_rate_chart():
         try:
-            portfolio_df, _, _ = portfolio_results()
+            portfolio_results()
         except Exception as exc:
             return _empty_figure(str(exc))
 
-        fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=portfolio_df["quarter_end"],
-                y=portfolio_df["ending_balance"],
-                mode="lines+markers",
-                name="Remaining Balance",
-                line={"color": LINE_BLUE, "width": 3},
-                marker={"color": LINE_BLUE, "size": 7},
-            )
+        if SOFR_RATES.empty or "sofr" not in SOFR_RATES.columns:
+            return _empty_figure("SOFR rate data is unavailable.")
+
+        sofr_df = SOFR_RATES.copy()
+        sofr_df["date"] = pd.to_datetime(sofr_df["date"], errors="coerce")
+        sofr_df["sofr"] = pd.to_numeric(sofr_df["sofr"], errors="coerce")
+        if "rate_status" in sofr_df.columns:
+            sofr_df["rate_status"] = sofr_df["rate_status"].fillna("assumed")
+        else:
+            sofr_df["rate_status"] = "assumed"
+        sofr_df = sofr_df.dropna(subset=["date", "sofr"])
+
+        if sofr_df.empty:
+            return _empty_figure("SOFR rate data is unavailable.")
+
+        sofr_by_quarter = (
+            sofr_df.loc[
+                sofr_df["date"].dt.is_quarter_end,
+                ["date", "sofr", "rate_status"],
+            ]
+            .sort_values("date", kind="stable")
+            .reset_index(drop=True)
         )
-        fig.update_layout(title=dict(text="Remaining Balance", y=0.95, yanchor="top"), template="plotly_dark", paper_bgcolor="#1f2937", plot_bgcolor="#1f2937", margin={"l": 20, "r": 20, "t": 80, "b": 20})
-        fig.update_xaxes(title="Quarter End")
-        fig.update_yaxes(title="Balance")
+
+        if sofr_by_quarter.empty:
+            sofr_by_quarter = sofr_df[["date", "sofr", "rate_status"]].sort_values(
+                "date", kind="stable"
+            ).reset_index(drop=True)
+
+        fig = go.Figure()
+        status_colors = {
+            "actual": LINE_BLUE,
+            "assumed": LIGHT_BLUE,
+        }
+
+        for rate_status, status_group in sofr_by_quarter.groupby("rate_status", sort=False):
+            fig.add_trace(
+                go.Scatter(
+                    x=status_group["date"],
+                    y=status_group["sofr"],
+                    mode="lines+markers",
+                    name=f"SOFR Rate ({str(rate_status).title()})",
+                    line={"color": status_colors.get(str(rate_status).lower(), LIGHT_BLUE), "width": 3},
+                    marker={"color": status_colors.get(str(rate_status).lower(), LIGHT_BLUE), "size": 7},
+                )
+            )
+        fig.update_layout(
+            title=dict(text="SOFR Rate", y=0.95, yanchor="top"),
+            template="plotly_dark",
+            paper_bgcolor="#1f2937",
+            plot_bgcolor="#1f2937",
+            margin={"l": 20, "r": 20, "t": 80, "b": 50},
+            annotations=[
+                {
+                    "text": "source: Federal Reserve Bank of ST. LOUIS",
+                    "xref": "paper",
+                    "yref": "paper",
+                    "x": 0,
+                    "y": -0.22,
+                    "showarrow": False,
+                    "xanchor": "left",
+                    "font": {"size": 10, "color": "#9ca3af"},
+                }
+            ],
+        )
+        fig.update_xaxes(title="Date")
+        fig.update_yaxes(title="SOFR Rate", tickformat=".2%")
         return fig
 
     @render_widget
@@ -1064,7 +1461,7 @@ def server(input, output, session):
             "Maturity Date",
             "Prepayment Date",
             "Spread",
-            "SOFR Assumption",
+            "SOFR",
             "PIK Interest",
             "Amortization",
             "OID",
