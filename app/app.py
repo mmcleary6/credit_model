@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 import random
+from functools import lru_cache
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -14,16 +16,16 @@ from shiny import App, reactive, render, ui
 from shinywidgets import output_widget, render_widget
 
 from asset_modeling.credit import loan_portfolio
+from data.sofr import get_sofr_data
 
 REQUIRED_COLUMNS = [
     "investment_name",
     "investment_date",
     "maturity_date",
-    "loan_size",
+    "par_value",
     "spread",
     "base_rate",
     "sofr_assumption",
-    "cash_interest_rate",
     "pik_interest",
     "amortization",
     "oid",
@@ -32,10 +34,8 @@ REQUIRED_COLUMNS = [
 ]
 
 NUMERIC_COLUMNS = [
-    "loan_size",
+    "par_value",
     "spread",
-    "sofr_assumption",
-    "cash_interest_rate",
     "pik_interest",
     "amortization",
     "oid",
@@ -43,6 +43,7 @@ NUMERIC_COLUMNS = [
 ]
 
 LINE_BLUE = "#2563eb"
+FRED_API_KEY = os.getenv("FRED_API_KEY")
 
 
 def _default_row(index: int) -> dict:
@@ -50,11 +51,10 @@ def _default_row(index: int) -> dict:
         "investment_name": f"Loan {index}",
         "investment_date": "2020-12-31",
         "maturity_date": "2030-12-31",
-        "loan_size": 15000000,
+        "par_value": 15000000,
         "spread": 0.06,
         "base_rate": "SOFR",
         "sofr_assumption": 0.04,
-        "cash_interest_rate": 0.08,
         "pik_interest": 0.02,
         "amortization": 0.01,
         "oid": 0.02,
@@ -90,16 +90,13 @@ def default_schedule() -> pd.DataFrame:
         )
         row["investment_date"] = investment_date.strftime("%Y-%m-%d")
         row["maturity_date"] = maturity_date.strftime("%Y-%m-%d")
-        row["loan_size"] = int(
+        row["par_value"] = int(
             round(random_generator.uniform(15000000, 100000000) / 1_000_000)
             * 1_000_000
         )
         row["oid"] = round(random_generator.uniform(0.02, 0.05), 4)
         row["sofr_assumption"] = round(random_generator.uniform(0.035, 0.04), 4)
         row["spread"] = round(random_generator.uniform(0.08, 0.11), 4)
-        row["cash_interest_rate"] = round(
-            row["sofr_assumption"] + row["spread"] - row["pik_interest"], 4
-        )
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -132,6 +129,38 @@ def _normalize_numeric_value(value: object):
     return value
 
 
+def _coerce_sofr_assumption(value: object) -> str | float:
+    if isinstance(value, str):
+        cleaned = value.strip()
+        if cleaned == "":
+            raise ValueError(
+                "Column 'sofr_assumption' must be numeric or the literal 'actual'."
+            )
+        if cleaned.lower() == "actual":
+            return "actual"
+        normalized_value = _normalize_numeric_value(cleaned)
+    else:
+        normalized_value = value
+
+    try:
+        return float(normalized_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            "Column 'sofr_assumption' must be numeric or the literal 'actual'."
+        ) from exc
+
+
+def _schedule_uses_actual_sofr(df: pd.DataFrame) -> bool:
+    return df["sofr_assumption"].apply(
+        lambda value: isinstance(value, str) and value.lower() == "actual"
+    ).any()
+
+
+@lru_cache(maxsize=1)
+def _get_daily_sofr_history(api_key: str) -> pd.DataFrame:
+    return get_sofr_data(api_key=api_key, frequency="D")
+
+
 def _coerce_schedule(df: pd.DataFrame) -> pd.DataFrame:
     working_df = df.copy()
 
@@ -149,6 +178,8 @@ def _coerce_schedule(df: pd.DataFrame) -> pd.DataFrame:
         if (working_df[col] == "").any():
             raise ValueError(f"Column '{col}' cannot contain blank values.")
 
+    working_df["base_rate"] = working_df["base_rate"].str.upper()
+
     for col in ["investment_date", "maturity_date"]:
         working_df[col] = pd.to_datetime(working_df[col], errors="coerce")
         if working_df[col].isna().any():
@@ -156,6 +187,13 @@ def _coerce_schedule(df: pd.DataFrame) -> pd.DataFrame:
 
     prepayment = pd.to_datetime(working_df["prepayment_date"], errors="coerce")
     working_df["prepayment_date"] = prepayment.astype("object").where(~prepayment.isna(), None)
+
+    try:
+        working_df["sofr_assumption"] = working_df["sofr_assumption"].apply(
+            _coerce_sofr_assumption
+        )
+    except ValueError as exc:
+        raise ValueError(str(exc)) from exc
 
     for col in NUMERIC_COLUMNS:
         normalized_numeric = working_df[col].apply(_normalize_numeric_value)
@@ -165,8 +203,8 @@ def _coerce_schedule(df: pd.DataFrame) -> pd.DataFrame:
                 f"Column '{col}' must be numeric (examples: 1000000, 1,000,000, 8%)."
             )
 
-    if (working_df["loan_size"] <= 0).any():
-        raise ValueError("'loan_size' must be greater than 0.")
+    if (working_df["par_value"] <= 0).any():
+        raise ValueError("'par_value' must be greater than 0.")
 
     if (working_df["maturity_date"] <= working_df["investment_date"]).any():
         raise ValueError("Each maturity_date must be after investment_date.")
@@ -198,7 +236,7 @@ def _clean_series(series: pd.Series) -> pd.Series:
 
 def _format_column_label(column_name: str) -> str:
     if str(column_name).lower() == "sofr_assumption":
-        return "SOFR Rate"
+        return "SOFR Assumption"
 
     replacements = {
         "irr": "IRR",
@@ -357,14 +395,14 @@ app_ui = ui.page_navbar(
             #schedule_df [role="columnheader"][aria-colindex="2"],
             #schedule_df table thead th:nth-child(3),
             #schedule_df [role="columnheader"][aria-colindex="3"],
-            #schedule_df table thead th:nth-child(8),
-            #schedule_df [role="columnheader"][aria-colindex="8"],
+            #schedule_df table thead th:nth-child(7),
+            #schedule_df [role="columnheader"][aria-colindex="7"],
             #funds_summary_table table thead th:nth-child(2),
             #funds_summary_table [role="columnheader"][aria-colindex="2"],
             #funds_summary_table table thead th:nth-child(3),
             #funds_summary_table [role="columnheader"][aria-colindex="3"],
-            #funds_summary_table table thead th:nth-child(8),
-            #funds_summary_table [role="columnheader"][aria-colindex="8"] {
+            #funds_summary_table table thead th:nth-child(7),
+            #funds_summary_table [role="columnheader"][aria-colindex="7"] {
                 max-width: 3rem !important;
             }
             #schedule_df table thead th,
@@ -609,8 +647,6 @@ def server(input, output, session):
 
     PCT_DISPLAY_COLUMNS = [
         "spread",
-        "sofr_assumption",
-        "cash_interest_rate",
         "pik_interest",
         "amortization",
         "oid",
@@ -625,8 +661,14 @@ def server(input, output, session):
                 display_df[col] = display_df[col].apply(
                     lambda v: f"{float(v) * 100:.2f}%" if v != "" and v is not None else v
                 )
-        if "loan_size" in display_df.columns:
-            display_df["loan_size"] = display_df["loan_size"].apply(
+        if "sofr_assumption" in display_df.columns:
+            display_df["sofr_assumption"] = display_df["sofr_assumption"].apply(
+                lambda value: "actual"
+                if isinstance(value, str) and value.lower() == "actual"
+                else (f"{float(value) * 100:.2f}%" if pd.notna(value) else "")
+            )
+        if "par_value" in display_df.columns:
+            display_df["par_value"] = display_df["par_value"].apply(
                 lambda v: f"{float(v):,.0f}" if v != "" and v is not None else v
             )
         display_df = _format_table_headers(display_df)
@@ -634,10 +676,10 @@ def server(input, output, session):
         centered_columns = [
             "Investment Date",
             "Maturity Date",
+            "Par Value",
             "Spread",
             "Base Rate",
-            "SOFR Rate",
-            "Cash Interest Rate",
+            "SOFR Assumption",
             "PIK Interest",
             "Amortization",
             "OID",
@@ -669,8 +711,14 @@ def server(input, output, session):
                 display_df[col] = display_df[col].apply(
                     lambda v: f"{float(v) * 100:.2f}%" if v != "" and v is not None else v
                 )
-        if "loan_size" in display_df.columns:
-            display_df["loan_size"] = display_df["loan_size"].apply(
+        if "sofr_assumption" in display_df.columns:
+            display_df["sofr_assumption"] = display_df["sofr_assumption"].apply(
+                lambda value: "actual"
+                if isinstance(value, str) and value.lower() == "actual"
+                else (f"{float(value) * 100:.2f}%" if pd.notna(value) else "")
+            )
+        if "par_value" in display_df.columns:
+            display_df["par_value"] = display_df["par_value"].apply(
                 lambda v: f"{float(v):,.0f}" if v != "" and v is not None else v
             )
         display_df = _format_table_headers(display_df)
@@ -713,7 +761,15 @@ def server(input, output, session):
     @reactive.calc
     def portfolio_results():
         normalized_schedule = _coerce_schedule(schedule_state())
-        result = loan_portfolio(normalized_schedule)
+        sofr_rates = None
+        if _schedule_uses_actual_sofr(normalized_schedule):
+            if not FRED_API_KEY:
+                raise ValueError(
+                    "FRED_API_KEY is required when any loan uses sofr_assumption='actual'."
+                )
+            sofr_rates = _get_daily_sofr_history(FRED_API_KEY)
+
+        result = loan_portfolio(normalized_schedule, sofr_rates=sofr_rates)
 
         if isinstance(result, tuple):
             if len(result) >= 3:
@@ -982,13 +1038,20 @@ def server(input, output, session):
             ).dt.strftime("%Y-%m-%d")
             display_df["prepayment_date"] = display_df["prepayment_date"].fillna("")
 
-        for col in ["loan_size", "total_payment"]:
+        for col in ["par_value", "total_payment"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda value: f"{float(value):,.2f}" if pd.notna(value) else ""
                 )
 
-        for col in ["spread", "sofr_assumption", "cash_interest_rate", "pik_interest", "amortization", "oid", "exit_fee", "irr"]:
+        if "sofr_assumption" in display_df.columns:
+            display_df["sofr_assumption"] = display_df["sofr_assumption"].apply(
+                lambda value: "actual"
+                if isinstance(value, str) and value.lower() == "actual"
+                else (f"{float(value) * 100:.2f}%" if pd.notna(value) else "")
+            )
+
+        for col in ["spread", "pik_interest", "amortization", "oid", "exit_fee", "irr"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda value: f"{float(value) * 100:.2f}%" if pd.notna(value) else ""
@@ -1001,8 +1064,7 @@ def server(input, output, session):
             "Maturity Date",
             "Prepayment Date",
             "Spread",
-            "SOFR Rate",
-            "Cash Interest Rate",
+            "SOFR Assumption",
             "PIK Interest",
             "Amortization",
             "OID",
@@ -1049,13 +1111,20 @@ def server(input, output, session):
             ).dt.strftime("%Y-%m-%d")
             display_df["prepayment_date"] = display_df["prepayment_date"].fillna("")
 
-        for col in ["loan_size", "total_payment"]:
+        for col in ["par_value", "total_payment"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda value: f"{float(value):,.2f}" if pd.notna(value) else ""
                 )
 
-        for col in ["spread", "sofr_assumption", "cash_interest_rate", "pik_interest", "amortization", "oid", "exit_fee", "irr"]:
+        if "sofr_assumption" in display_df.columns:
+            display_df["sofr_assumption"] = display_df["sofr_assumption"].apply(
+                lambda value: "actual"
+                if isinstance(value, str) and value.lower() == "actual"
+                else (f"{float(value) * 100:.2f}%" if pd.notna(value) else "")
+            )
+
+        for col in ["spread", "pik_interest", "amortization", "oid", "exit_fee", "irr"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda value: f"{float(value) * 100:.2f}%" if pd.notna(value) else ""
