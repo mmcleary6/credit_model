@@ -3,3 +3,7 @@ shiny>=1.0
 shinywidgets>=0.3
 plotly>=5.0
 Jinja2>=3.0
+openai>=1.0
+beautifulsoup4>=4.12
+lxml>=5.0
+html5lib>=1.1
