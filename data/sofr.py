@@ -78,6 +78,26 @@ def get_sofr_data(api_key, frequency='D', end_date=None):
 
     sofr_df['rate_status'] = 'actual'
 
+    # Fill missing values and missing dates within the actual observation window.
+    # 1) Forward-fill NaN values where the date row exists but the rate is missing.
+    sofr_df = sofr_df.sort_values('date').reset_index(drop=True)
+    sofr_df['value'] = sofr_df['value'].ffill()
+
+    # 2) Reindex to a continuous daily series so any gaps in the date sequence
+    #    are filled by rolling forward the previous known value.
+    min_date = sofr_df['date'].min()
+    max_actual_date = sofr_df['date'].max()
+    if pd.notna(min_date) and pd.notna(max_actual_date):
+        full_dates = pd.date_range(start=min_date, end=max_actual_date, freq='D')
+        sofr_df = (
+            sofr_df.set_index('date')
+            .reindex(full_dates)
+            .rename_axis('date')
+            .reset_index()
+        )
+        sofr_df['value'] = sofr_df['value'].ffill()
+        sofr_df['rate_status'] = sofr_df['rate_status'].fillna('actual')
+
     if end_date is not None:
         try:
             normalized_end_date = pd.Timestamp(end_date).normalize()

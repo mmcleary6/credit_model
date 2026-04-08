@@ -16,6 +16,7 @@ from shiny import App, reactive, render, ui
 from shinywidgets import output_widget, render_widget
 
 from asset_modeling.credit import loan_portfolio
+from data.ratings import get_effective_yield
 from data.sofr import get_sofr_data
 
 REQUIRED_COLUMNS = [
@@ -46,6 +47,7 @@ LINE_BLUE = "#2563eb"
 LIGHT_BLUE = "#7dd3fc"
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 SOFR_RATES = pd.DataFrame()
+DEFAULT_SCHEDULE_INVESTMENT_END_DATE = "2024-12-31"
 
 
 def _default_row(index: int) -> dict:
@@ -74,9 +76,63 @@ def _random_quarter_end(
     return random_generator.choice(list(quarter_ends))
 
 
+@lru_cache(maxsize=1)
+def _get_daily_b_yield_history(api_key: str, end_date: str) -> pd.DataFrame:
+    return get_effective_yield(
+        api_key=api_key,
+        rating="B",
+        frequency="D",
+        end_date=end_date,
+    )
+
+
+def _lookup_rate_value_on_or_before_date(
+    rate_df: pd.DataFrame,
+    lookup_date: object,
+    value_column: str,
+) -> float | None:
+    if rate_df.empty or value_column not in rate_df.columns or "date" not in rate_df.columns:
+        return None
+
+    working_df = rate_df[["date", value_column]].copy()
+    working_df["date"] = pd.to_datetime(working_df["date"], errors="coerce").dt.normalize()
+    working_df[value_column] = pd.to_numeric(working_df[value_column], errors="coerce")
+    working_df = working_df.dropna(subset=["date", value_column]).sort_values("date")
+
+    if working_df.empty:
+        return None
+
+    normalized_lookup_date = pd.Timestamp(lookup_date).normalize()
+    matching_rows = working_df.loc[working_df["date"] == normalized_lookup_date, value_column]
+    if not matching_rows.empty:
+        return float(matching_rows.iloc[-1])
+
+    prior_rows = working_df.loc[working_df["date"] <= normalized_lookup_date, value_column]
+    if not prior_rows.empty:
+        return float(prior_rows.iloc[-1])
+
+    return float(working_df.iloc[0][value_column])
+
+
 def default_schedule() -> pd.DataFrame:
     random_generator = random.Random()
     rows = []
+    sofr_history = pd.DataFrame()
+    b_yield_history = pd.DataFrame()
+
+    if FRED_API_KEY:
+        try:
+            sofr_history = _get_daily_sofr_history(
+                FRED_API_KEY,
+                DEFAULT_SCHEDULE_INVESTMENT_END_DATE,
+            )
+            b_yield_history = _get_daily_b_yield_history(
+                FRED_API_KEY,
+                DEFAULT_SCHEDULE_INVESTMENT_END_DATE,
+            )
+        except Exception:
+            sofr_history = pd.DataFrame()
+            b_yield_history = pd.DataFrame()
 
     for index in range(1, 26):
         row = _default_row(index)
@@ -97,8 +153,28 @@ def default_schedule() -> pd.DataFrame:
             * 1_000_000
         )
         row["oid"] = round(random_generator.uniform(0.02, 0.05), 4)
-        row["sofr_assumption"] = round(random_generator.uniform(0.035, 0.04), 4)
-        row["spread"] = round(random_generator.uniform(0.08, 0.11), 4)
+        sofr_value = _lookup_rate_value_on_or_before_date(
+            sofr_history,
+            investment_date,
+            "sofr",
+        )
+        spread_value = _lookup_rate_value_on_or_before_date(
+            b_yield_history,
+            investment_date,
+            "effective_yield",
+        )
+        row["sofr_assumption"] = (
+            round(sofr_value, 4)
+            if sofr_value is not None
+            else round(random_generator.uniform(0.035, 0.04), 4)
+        )
+        row["spread"] = (
+            round(spread_value, 4)
+            if spread_value is not None
+            else round(random_generator.uniform(0.08, 0.11), 4)
+        )
+        # row["sofr_assumption"] = 'actual'
+        # row["spread"] = 'actual'
         rows.append(row)
 
     return pd.DataFrame(rows)
@@ -533,6 +609,29 @@ app_ui = ui.page_navbar(
                 font-size: 0.8rem !important;
                 color: #d1d5db !important;
             }
+            #funds_detail_table table thead th,
+            #funds_detail_table [role="columnheader"] {
+                white-space: normal !important;
+                width: max-content !important;
+                min-width: max-content !important;
+            }
+            #funds_detail_table table tbody td,
+            #funds_detail_table [role="gridcell"] {
+                white-space: nowrap !important;
+                width: max-content !important;
+                min-width: max-content !important;
+            }
+            #funds_detail_table table thead th,
+            #funds_detail_table [role="columnheader"] {
+                background-color: #343a40 !important;
+                color: #ffffff !important;
+                font-size: 0.8rem !important;
+            }
+            #funds_detail_table table tbody td,
+            #funds_detail_table [role="gridcell"] {
+                font-size: 0.8rem !important;
+                color: #d1d5db !important;
+            }
             #portfolio_outputs_table table thead th,
             #portfolio_outputs_table [role="columnheader"] {
                 background-color: #343a40 !important;
@@ -568,6 +667,8 @@ app_ui = ui.page_navbar(
             #schedule_df [role="columnheader"],
             #portfolio_outputs_table table thead th,
             #portfolio_outputs_table [role="columnheader"],
+            #funds_detail_table table thead th,
+            #funds_detail_table [role="columnheader"],
             #funds_summary_table table thead th,
             #funds_summary_table [role="columnheader"] {
                 text-align: center !important;
@@ -586,6 +687,10 @@ app_ui = ui.page_navbar(
             #portfolio_outputs_table table tbody td,
             #portfolio_outputs_table [role="columnheader"],
             #portfolio_outputs_table [role="gridcell"],
+            #funds_detail_table table thead th,
+            #funds_detail_table table tbody td,
+            #funds_detail_table [role="columnheader"],
+            #funds_detail_table [role="gridcell"],
             #funds_summary_table table thead th,
             #funds_summary_table table tbody td,
             #funds_summary_table [role="columnheader"],
@@ -607,6 +712,10 @@ app_ui = ui.page_navbar(
             #portfolio_outputs_table .data-grid-summary,
             #portfolio_outputs_table [role="status"],
             #portfolio_outputs_table [aria-live="polite"],
+            #funds_detail_table .shiny-data-grid-summary,
+            #funds_detail_table .data-grid-summary,
+            #funds_detail_table [role="status"],
+            #funds_detail_table [aria-live="polite"],
             #funds_summary_table .shiny-data-grid-summary,
             #funds_summary_table .data-grid-summary,
             #funds_summary_table [role="status"],
@@ -687,22 +796,49 @@ app_ui = ui.page_navbar(
             #schedule_df [role="row"],
             #portfolio_outputs_table table tbody tr,
             #portfolio_outputs_table [role="row"],
+            #funds_detail_table table tbody tr,
+            #funds_detail_table [role="row"],
             #funds_summary_table table tbody tr,
             #funds_summary_table [role="row"] {
                 background-color: #1f2937 !important;
             }
             #schedule_df table tbody tr:nth-child(even),
             #portfolio_outputs_table table tbody tr:nth-child(even),
+            #funds_detail_table table tbody tr:nth-child(even),
             #funds_summary_table table tbody tr:nth-child(even) {
                 background-color: #253347 !important;
             }
-            #schedule_df table, #portfolio_outputs_table table, #funds_summary_table table {
+            #schedule_df table, #portfolio_outputs_table table, #funds_detail_table table, #funds_summary_table table {
                 border-color: #374151 !important;
             }
             #schedule_df table td, #schedule_df table th,
             #portfolio_outputs_table table td, #portfolio_outputs_table table th,
+            #funds_detail_table table td, #funds_detail_table table th,
             #funds_summary_table table td, #funds_summary_table table th {
                 border-color: #374151 !important;
+            }
+            #cashflow_combined_chart,
+            #sofr_rate_chart,
+            #tvpi_chart,
+            #portfolio_irr_chart {
+                width: 100%;
+                min-width: 0;
+                overflow: hidden;
+            }
+            #cashflow_combined_chart .js-plotly-plot,
+            #cashflow_combined_chart .plot-container,
+            #cashflow_combined_chart .plotly,
+            #sofr_rate_chart .js-plotly-plot,
+            #sofr_rate_chart .plot-container,
+            #sofr_rate_chart .plotly,
+            #tvpi_chart .js-plotly-plot,
+            #tvpi_chart .plot-container,
+            #tvpi_chart .plotly,
+            #portfolio_irr_chart .js-plotly-plot,
+            #portfolio_irr_chart .plot-container,
+            #portfolio_irr_chart .plotly {
+                width: 100% !important;
+                max-width: 100% !important;
             }
             """)
         )
@@ -714,23 +850,65 @@ app_ui = ui.page_navbar(
                 ui.input_action_button("add_row", "Add investment"),
                 ui.input_action_button("remove_selected_rows", "Remove investment"),
                 ui.input_action_button("reset_schedule", "Reset defaults"),
+                ui.hr(),
+                ui.input_action_button("run_schedule", "Run Schedule", class_="btn-primary"),
+                ui.output_ui("run_schedule_status"),
             ),
             ui.p(
                 "Schedule of Investments. Click 'Add investment' to add rows to the schedule. Select rows and click 'Remove investment' to delete them. Click 'Reset defaults' to restore the original sample schedule.",
             ),
             ui.div(
-                {"style": "width: fit-content; margin-left: auto; margin-right: auto;"},
-                ui.output_data_frame("schedule_df"),
+                {
+                    "style": "display: flex; flex-direction: column; gap: 12px; width: 100%;"
+                },
                 ui.div(
-                    {"style": "text-align: right; margin-top: 15px;"},
-                    ui.download_button("download_schedule_csv", "Download Loan Schedule CSV"),
+                    {
+                        "style": "display: flex; flex-direction: row; justify-content: center; align-items: flex-start; gap: 20px; width: 100%;"
+                    },
+                    ui.div(
+                        {"style": "flex: 1 1 0; min-width: 0; max-width: 100%;"},
+                        ui.h4("Schedule Of Investments", style="font-size: 0.95rem; margin-top: 0; margin-bottom: 0.5rem;"),
+                        ui.div(
+                            {"style": "overflow: auto; max-width: 100%; max-height: 70vh;"},
+                            ui.output_data_frame("schedule_df"),
+                        ),
+                        ui.div(
+                            {"style": "text-align: right; margin-top: 15px;"},
+                            ui.download_button("download_schedule_csv", "Download Loan Schedule CSV"),
+                        ),
+                    ),
                 ),
             ),
             ui.output_ui("schedule_error"),
         ),
     ),
     ui.nav_panel(
-        "Portfolio Outputs",
+        "Investments",
+        ui.layout_sidebar(
+            ui.sidebar(
+                ui.input_select(
+                    "selected_investment_name",
+                    "Investment",
+                    choices=[],
+                ),
+            ),
+            ui.div(
+                {
+                    "style": "display: flex; flex-direction: column; gap: 12px; width: 100%;"
+                },
+                ui.div(
+                    {"style": "flex: 1 1 0; min-width: 0; max-width: 100%;"},
+                    ui.h4("Investment Cash Flows", style="font-size: 0.95rem; margin-top: 0; margin-bottom: 0.5rem;"),
+                    ui.div(
+                        {"style": "overflow: auto; max-width: 100%; max-height: 70vh;"},
+                        ui.output_data_frame("funds_detail_table"),
+                    ),
+                ),
+            ),
+        ),
+    ),
+    ui.nav_panel(
+        "Gross Cash Flows",
         ui.layout_sidebar(
             ui.sidebar(
                 ui.h4("Scenario Analysis"),
@@ -794,31 +972,53 @@ app_ui = ui.page_navbar(
                 ),
             ),
             ui.output_ui("portfolio_error"),
-            ui.layout_columns(
-                output_widget("cashflow_combined_chart"),
-                output_widget("sofr_rate_chart"),
-                col_widths=(6, 6),
-            ),
-            ui.layout_columns(
-                output_widget("tvpi_chart"),
-                output_widget("portfolio_irr_chart"),
-                col_widths=(6, 6),
+            ui.div(
+                {
+                    "style": "display: flex; flex-direction: row; align-items: stretch; gap: 20px; width: 100%; flex-wrap: nowrap;"
+                },
+                ui.div(
+                    {"style": "flex: 1 1 0; min-width: 0; overflow: hidden;"},
+                    output_widget("cashflow_combined_chart"),
+                ),
+                ui.div(
+                    {"style": "flex: 1 1 0; min-width: 0; overflow: hidden;"},
+                    output_widget("sofr_rate_chart"),
+                ),
             ),
             ui.div(
-                {"style": "display: flex; flex-direction: row; justify-content: center; align-items: flex-start; width: 100%;"},
+                {
+                    "style": "display: flex; flex-direction: row; align-items: stretch; gap: 20px; width: 100%; flex-wrap: nowrap;"
+                },
                 ui.div(
-                    {"style": "flex: 0 0 auto;"},
+                    {"style": "flex: 1 1 0; min-width: 0; overflow: hidden;"},
+                    output_widget("tvpi_chart"),
+                ),
+                ui.div(
+                    {"style": "flex: 1 1 0; min-width: 0; overflow: hidden;"},
+                    output_widget("portfolio_irr_chart"),
+                ),
+            ),
+            ui.div(
+                {"style": "display: flex; flex-direction: row; justify-content: center; align-items: flex-start; gap: 20px; width: 100%; min-width: 0;"},
+                ui.div(
+                    {"style": "flex: 1 1 0; min-width: 0; max-width: 100%;"},
                     ui.h4("Portfolio Results", style="font-size: 0.95rem;"),
-                    ui.output_data_frame("portfolio_outputs_table"),
+                    ui.div(
+                        {"style": "overflow: auto; max-width: 100%; max-height: 70vh;"},
+                        ui.output_data_frame("portfolio_outputs_table"),
+                    ),
                     ui.div(
                         {"style": "text-align: right; margin-top: 15px;"},
                         ui.download_button("download_portfolio_outputs_csv", "Download Portfolio Results CSV"),
                     ),
                 ),
                 ui.div(
-                    {"style": "flex: 0 0 auto; margin-left: 20px; overflow-x: auto; max-width: 100%;"},
+                    {"style": "flex: 1 1 0; min-width: 0; max-width: 100%;"},
                     ui.h4("Funds Summary", style="font-size: 0.95rem;"),
-                    ui.output_data_frame("funds_summary_table"),
+                    ui.div(
+                        {"style": "overflow: auto; max-width: 100%; max-height: 70vh;"},
+                        ui.output_data_frame("funds_summary_table"),
+                    ),
                     ui.div(
                         {"style": "text-align: right; margin-top: 15px;"},
                         ui.download_button("download_funds_summary_csv", "Download Funds Summary CSV"),
@@ -827,7 +1027,7 @@ app_ui = ui.page_navbar(
             ),
         ),
     ),
-    title=ui.tags.img(src="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 350 100'><defs><linearGradient id='textGrad' x1='0%' y1='0%' x2='0%' y2='100%'><stop offset='0%' style='stop-color:%23d1d5db;stop-opacity:1' /><stop offset='100%' style='stop-color:%23ffffff;stop-opacity:1' /></linearGradient></defs><rect fill='%232563eb' width='350' height='100'/><polygon points='0,80 40,40 80,60 120,30 160,50 200,20 240,45 280,35 320,55 350,40 350,100 0,100' fill='%231e3a8a' opacity='0.7'/><polyline points='0,80 40,40 80,60 120,30 160,50 200,20 240,45 280,35 320,55 350,40 350,100 0,100' stroke='black' stroke-width='1.5' fill='none'/><polyline points='20,90 60,50 100,75 140,45 180,65 220,35 260,60 300,50 330,70 350,60 350,100 20,100' stroke='black' stroke-width='1' fill='none' opacity='0.6'/><text x='175' y='70' font-size='48' font-weight='700' font-stretch='condensed' fill='url(%23textGrad)' stroke='black' stroke-width='1' text-anchor='middle' font-family='Arial'>MMC Capital</text></svg>", style="height: 40px; width: auto;"),
+    title=ui.tags.img(src="logo4.PNG", style="height: 40px; width: auto;"),
     window_title="Portfolio Analytics"
 )
 
@@ -840,6 +1040,14 @@ def server(input, output, session):
     applied_rate_shock_start_date = reactive.value(None)
     applied_rate_change_bps = reactive.value(0)
     applied_rate_change_start_date = reactive.value(None)
+
+    # Persisted base run results (populated by "Run Schedule" button)
+    base_portfolio_df = reactive.value(pd.DataFrame())
+    base_funds_df = reactive.value(pd.DataFrame())
+    base_funds_summary_df = reactive.value(pd.DataFrame())
+    base_schedule_snapshot = reactive.value(pd.DataFrame())
+    base_sofr_rates = reactive.value(pd.DataFrame())
+    schedule_has_been_run = reactive.value(False)
 
     @reactive.effect
     @reactive.event(input.add_row)
@@ -966,55 +1174,29 @@ def server(input, output, session):
             if len(df) > 0:
                 schedule_state.set(df)
 
-    @reactive.calc
-    def portfolio_results():
+    def _execute_run_schedule():
         global SOFR_RATES
 
         normalized_schedule = _coerce_schedule(schedule_state())
+
+        # Force all sofr_assumption values to "actual"
+        normalized_schedule["sofr_assumption"] = "actual"
+
         max_maturity_date = normalized_schedule["maturity_date"].max()
-        rate_shock_bps = applied_rate_shock_bps()
-        shock_start_date = applied_rate_shock_start_date()
-        rate_change_bps = applied_rate_change_bps()
-        change_start_date = applied_rate_change_start_date()
 
-        if FRED_API_KEY:
-            SOFR_RATES = _get_daily_sofr_history(
-                FRED_API_KEY,
-                pd.Timestamp(max_maturity_date).strftime("%Y-%m-%d"),
-            ).copy()
-            SOFR_RATES = _apply_rate_shock_to_assumed_sofr(
-                SOFR_RATES,
-                rate_shock_bps,
-                shock_start_date,
+        if not FRED_API_KEY:
+            raise ValueError(
+                "FRED_API_KEY is required to run the schedule with actual SOFR rates."
             )
-            SOFR_RATES = _apply_linear_rate_change_to_assumed_sofr(
-                SOFR_RATES,
-                rate_change_bps,
-                change_start_date,
-            )
-        else:
-            SOFR_RATES = pd.DataFrame()
 
-        shocked_schedule = _apply_rate_shock_to_schedule(
-            normalized_schedule,
-            rate_shock_bps,
-            shock_start_date,
-        )
-        shocked_schedule = _apply_linear_rate_change_to_schedule(
-            shocked_schedule,
-            rate_change_bps,
-            change_start_date,
-        )
+        SOFR_RATES = _get_daily_sofr_history(
+            FRED_API_KEY,
+            pd.Timestamp(max_maturity_date).strftime("%Y-%m-%d"),
+        ).copy()
 
-        sofr_rates = None
-        if _schedule_uses_actual_sofr(shocked_schedule):
-            if not FRED_API_KEY:
-                raise ValueError(
-                    "FRED_API_KEY is required when any loan uses sofr_assumption='actual'."
-                )
-            sofr_rates = SOFR_RATES.copy()
+        sofr_rates = SOFR_RATES.copy()
 
-        result = loan_portfolio(shocked_schedule, sofr_rates=sofr_rates)
+        result = loan_portfolio(normalized_schedule, sofr_rates=sofr_rates)
 
         if isinstance(result, tuple):
             if len(result) >= 3:
@@ -1032,30 +1214,110 @@ def server(input, output, session):
         if portfolio_df.empty:
             raise ValueError("Portfolio output is empty. Add valid schedule rows.")
 
+        base_portfolio_df.set(portfolio_df)
+        base_funds_df.set(funds_df)
+        base_funds_summary_df.set(funds_summary_df)
+        base_schedule_snapshot.set(normalized_schedule)
+        base_sofr_rates.set(SOFR_RATES.copy())
+        schedule_has_been_run.set(True)
+
+    @reactive.effect
+    @reactive.event(input.run_schedule)
+    def _run_schedule():
+        _execute_run_schedule()
+
+    @reactive.effect
+    def _run_schedule_on_load():
+        if not schedule_has_been_run():
+            _execute_run_schedule()
+
+    @render.ui
+    def run_schedule_status():
+        if schedule_has_been_run():
+            return ui.div(
+                "Schedule has been run.",
+                style="color: #10b981; font-size: 0.8rem; margin-top: 8px;",
+            )
+        return ui.div(
+            "Click 'Run Schedule' to compute results.",
+            style="color: #9ca3af; font-size: 0.8rem; margin-top: 8px;",
+        )
+
+    @reactive.calc
+    def portfolio_results():
+        global SOFR_RATES
+
+        if not schedule_has_been_run():
+            raise ValueError("Run the schedule on the Loan Schedule tab first.")
+
+        snapshot_schedule = base_schedule_snapshot()
+        if snapshot_schedule.empty:
+            raise ValueError("Run the schedule on the Loan Schedule tab first.")
+
+        rate_shock_bps = applied_rate_shock_bps()
+        shock_start_date = applied_rate_shock_start_date()
+        rate_change_bps = applied_rate_change_bps()
+        change_start_date = applied_rate_change_start_date()
+
+        has_scenario = bool(rate_shock_bps) or bool(rate_change_bps)
+
+        if not has_scenario:
+            SOFR_RATES = base_sofr_rates()
+            return base_portfolio_df(), base_funds_df(), base_funds_summary_df()
+
+        # Re-run with scenario adjustments applied to the persisted snapshot
+        SOFR_RATES = base_sofr_rates().copy()
+        SOFR_RATES = _apply_rate_shock_to_assumed_sofr(
+            SOFR_RATES,
+            rate_shock_bps,
+            shock_start_date,
+        )
+        SOFR_RATES = _apply_linear_rate_change_to_assumed_sofr(
+            SOFR_RATES,
+            rate_change_bps,
+            change_start_date,
+        )
+
+        shocked_schedule = _apply_rate_shock_to_schedule(
+            snapshot_schedule.copy(),
+            rate_shock_bps,
+            shock_start_date,
+        )
+        shocked_schedule = _apply_linear_rate_change_to_schedule(
+            shocked_schedule,
+            rate_change_bps,
+            change_start_date,
+        )
+
+        sofr_rates = SOFR_RATES.copy()
+
+        result = loan_portfolio(shocked_schedule, sofr_rates=sofr_rates)
+
+        if isinstance(result, tuple):
+            if len(result) >= 3:
+                portfolio_df, funds_df, funds_summary_df = result[0], result[1], result[2]
+            elif len(result) >= 2:
+                portfolio_df, funds_df = result[0], result[1]
+                funds_summary_df = pd.DataFrame()
+            else:
+                portfolio_df, funds_df = pd.DataFrame(), pd.DataFrame()
+                funds_summary_df = pd.DataFrame()
+        else:
+            portfolio_df, funds_df = pd.DataFrame(), pd.DataFrame()
+            funds_summary_df = pd.DataFrame()
+
+        if portfolio_df.empty:
+            raise ValueError("Portfolio output is empty.")
+
         return portfolio_df, funds_df, funds_summary_df
 
     @reactive.effect
-    def _initialize_portfolio_outputs():
-        schedule_state()
-        try:
-            portfolio_results()
-        except Exception:
+    def _set_default_rate_shock_start_date():
+        if not schedule_has_been_run():
             return
 
-    @reactive.effect
-    def _set_default_rate_shock_start_date():
-        try:
-            normalized_schedule = _coerce_schedule(schedule_state())
-            max_maturity_date = normalized_schedule["maturity_date"].max()
-
-            if not FRED_API_KEY:
-                return
-
-            raw_sofr_rates = _get_daily_sofr_history(
-                FRED_API_KEY,
-                pd.Timestamp(max_maturity_date).strftime("%Y-%m-%d"),
-            )
-        except Exception:
+        raw_sofr_rates = base_sofr_rates()
+        if raw_sofr_rates.empty:
             return
 
         default_start_date = _first_assumed_sofr_date(raw_sofr_rates)
@@ -1139,6 +1401,40 @@ def server(input, output, session):
         except Exception as exc:
             return ui.div(str(exc), style="color: #b91c1c;")
 
+    @reactive.calc
+    def investment_name_choices() -> list[str]:
+        try:
+            _, funds_df, _ = portfolio_results()
+        except Exception:
+            return []
+
+        if funds_df.empty or "investment_name" not in funds_df.columns:
+            return []
+
+        return (
+            funds_df["investment_name"]
+            .dropna()
+            .astype(str)
+            .drop_duplicates()
+            .tolist()
+        )
+
+    @reactive.effect
+    def _update_selected_investment_name():
+        choices = investment_name_choices()
+        current_value = input.selected_investment_name()
+        selected_value = current_value if current_value in choices else None
+
+        if selected_value is None and choices:
+            selected_value = choices[0]
+
+        ui.update_select(
+            "selected_investment_name",
+            choices=choices,
+            selected=selected_value,
+            session=session,
+        )
+
     @render_widget
     def cashflow_combined_chart():
         try:
@@ -1169,7 +1465,7 @@ def server(input, output, session):
                 y=cumulative["cumulative_cashflow"],
                 mode="lines+markers",
                 name="Cumulative Cash Flow",
-                line={"color": LINE_BLUE, "width": 3},
+                line={"color": LINE_BLUE, "width": 2},
                 marker={"color": LINE_BLUE, "size": 7},
             )
         )
@@ -1244,7 +1540,7 @@ def server(input, output, session):
                     y=status_group["sofr"],
                     mode="lines+markers",
                     name=f"SOFR Rate ({str(rate_status).title()})",
-                    line={"color": status_colors.get(str(rate_status).lower(), LIGHT_BLUE), "width": 3},
+                    line={"color": status_colors.get(str(rate_status).lower(), LIGHT_BLUE), "width": 2},
                     marker={"color": status_colors.get(str(rate_status).lower(), LIGHT_BLUE), "size": 7},
                 )
             )
@@ -1290,7 +1586,7 @@ def server(input, output, session):
                 y=tvpi_df["tvpi"],
                 mode="lines+markers",
                 name="TVPI",
-                line={"color": LINE_BLUE, "width": 3},
+                line={"color": LINE_BLUE, "width": 2},
                 marker={"color": LINE_BLUE, "size": 7},
             )
         )
@@ -1318,7 +1614,7 @@ def server(input, output, session):
                 y=irr_df["irr"],
                 mode="lines+markers",
                 name="Portfolio IRR",
-                line={"color": LINE_BLUE, "width": 3},
+                line={"color": LINE_BLUE, "width": 2},
                 marker={"color": LINE_BLUE, "size": 7},
             )
         )
@@ -1412,6 +1708,106 @@ def server(input, output, session):
             )
         display_df = _format_table_headers(display_df)
         yield display_df.to_csv(index=False)
+
+    @render.data_frame
+    def funds_detail_table():
+        try:
+            _, funds_df, _ = portfolio_results()
+        except Exception:
+            return render.DataGrid(pd.DataFrame(), editable=False, width="fit-content")
+
+        selected_investment_name = input.selected_investment_name()
+        if (
+            funds_df.empty
+            or "investment_name" not in funds_df.columns
+            or not selected_investment_name
+        ):
+            return render.DataGrid(pd.DataFrame(), editable=False, width="fit-content")
+
+        display_df = funds_df.loc[
+            funds_df["investment_name"] == selected_investment_name
+        ].copy()
+
+        if display_df.empty:
+            return render.DataGrid(pd.DataFrame(), editable=False, width="fit-content")
+
+        display_df = display_df.drop(
+            columns=["original_investment", "base_rate"],
+            errors="ignore",
+        )
+
+        for column_name in ["quarter_end", "prepayment_date"]:
+            if column_name in display_df.columns:
+                display_df[column_name] = pd.to_datetime(
+                    display_df[column_name], errors="coerce"
+                ).dt.strftime("%Y-%m-%d")
+                display_df[column_name] = display_df[column_name].fillna("")
+
+        currency_columns = [
+            "par_value",
+            "original_investment",
+            "invested_amount",
+            "beginning_balance",
+            "amortization",
+            "pik_interest",
+            "ending_balance",
+            "cash_interest",
+            "fees",
+            "remaining_balance_payment",
+            "total_payment",
+        ]
+        for column_name in currency_columns:
+            if column_name in display_df.columns:
+                display_df[column_name] = display_df[column_name].apply(
+                    lambda value: f"{float(value):,.2f}" if pd.notna(value) else ""
+                )
+
+        rate_columns = [
+            "sofr_rate",
+            "spread",
+            "pik_rate",
+            "cash_interest_rate",
+            "oid",
+            "exit_fee",
+            "irr",
+        ]
+        for column_name in rate_columns:
+            if column_name in display_df.columns:
+                display_df[column_name] = display_df[column_name].apply(
+                    lambda value: f"{float(value) * 100:.2f}%" if pd.notna(value) else ""
+                )
+
+        display_df = _format_table_headers(display_df)
+
+        centered_columns = [
+            "Quarter End",
+            "Prepayment Date",
+            "Base Rate",
+            "Rate Status",
+            "SOFR Rate",
+            "Spread",
+            "PIK Rate",
+            "Cash Interest Rate",
+            "OID",
+            "Exit Fee",
+            "IRR",
+        ]
+        center_styles = []
+        for column_name in centered_columns:
+            if column_name in display_df.columns:
+                center_styles.append(
+                    {
+                        "cols": [display_df.columns.get_loc(column_name)],
+                        "style": {"textAlign": "center"},
+                    }
+                )
+
+        return render.DataGrid(
+            display_df,
+            editable=False,
+            width="fit-content",
+            styles=center_styles,
+        )
 
     @render.data_frame
     def funds_summary_table():
@@ -1531,4 +1927,4 @@ def server(input, output, session):
         yield display_df.to_csv(index=False)
 
 
-app = App(app_ui, server)
+app = App(app_ui, server, static_assets=Path(__file__).resolve().parent)
