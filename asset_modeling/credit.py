@@ -34,6 +34,7 @@ from .utilities import _irr_quarterly, _format_irr, _get_periodicity_config, _bu
 # from utilities import _irr_quarterly, _format_irr, _get_periodicity_config, _build_payment_dates, _prepare_sofr_table, _resolve_sofr_rate
 # sys.path.append(str(Path(__file__).resolve().parent.parent))
 # from data.sofr import get_sofr_data
+# from data.ratings import get_effective_yield
 # fred_api_key = os.getenv("FRED_API_KEY")
 
 def private_credit_loan_model(
@@ -65,7 +66,7 @@ def private_credit_loan_model(
         ``investment_date``.
     par_value : float
         Original principal balance of the loan.
-    spread : float
+    spread : pandas.DataFrame or float or None
         Annualized credit spread expressed as a decimal.
     base_rate : str
         Name of the base reference rate. When set to ``"SOFR"``, the model
@@ -105,13 +106,16 @@ def private_credit_loan_model(
     The modeled quarterly rate is defined as
     ``cash_interest_rate = SOFR + spread - pik_interest``. Amortization is
     calculated on original par value rather than current balance.
+
+    NAV is calculated as the initial investment + accrued OID value + accrued PIK interest adjusted for change in spread.
+        - NAV goes to zero on maturity or prepayment date.
     """
 
     # investment_name="Example Corp Term Loan"
     # investment_date=pd.Timestamp("2024-12-31")
     # maturity_date=pd.Timestamp("2029-12-31")
     # par_value=1_000_000
-    # spread=0.06
+    # # spread=0.06
     # base_rate='SOFR'
     # # sofr_assumption=0.04
     # # sofr_floor = 0.01
@@ -120,7 +124,8 @@ def private_credit_loan_model(
     # oid=0.02
     # exit_fee=0.02
     # prepayment_date=None
-    # sofr_rates=get_sofr_data(api_key=fred_api_key, frequency='D')
+    # sofr_rates=get_sofr_data(api_key=fred_api_key, frequency='D', end_date=maturity_date)
+    # spread=get_effective_yield(rating="B", api_key=fred_api_key, frequency='D', end_date=maturity_date)
 
     if prepayment_date is None or pd.isna(prepayment_date):
         end_date = maturity_date
@@ -136,6 +141,23 @@ def private_credit_loan_model(
         raise ValueError("maturity_date must be after investment_date")
     if par_value <= 0:
         raise ValueError("par_value must be positive")
+
+    spread_table = None
+    if isinstance(spread, pd.DataFrame):
+        spread_table = spread.copy()
+        spread_table["date"] = pd.to_datetime(spread_table["date"]).dt.normalize()
+        spread_table = spread_table.sort_values("date", ascending=False).reset_index(drop=True)
+        match = spread_table.loc[spread_table["date"] == investment_date, "effective_yield"]
+        if not match.empty:
+            spread = float(match.iloc[0])
+        else:
+            prior = spread_table.loc[spread_table["date"] <= investment_date]
+            if not prior.empty:
+                spread = float(prior.iloc[0]["effective_yield"])
+            else:
+                spread = float(spread_table.iloc[-1]["effective_yield"])
+    else:
+        spread = float(spread)
 
     base_rate_name = str(base_rate).strip().upper()
 
@@ -161,6 +183,7 @@ def private_credit_loan_model(
         quarter_ends = pd.DatetimeIndex([end_date])
 
     quarterly_amortization = par_value * (amortization / 4.0)
+    original_investment = par_value * (1 - oid)
     # quarterly_pik_interest = par_value * (pik_interest / 4.0)
 
     rows = []
@@ -182,7 +205,7 @@ def private_credit_loan_model(
             rate_status = "assumed"
 
         if quarter_end == investment_date:
-            invested_amount = par_value * (1 - oid)
+            invested_amount = original_investment
             sofr_rate = 0
             spread_rate = 0
             pik_rate = 0
@@ -193,9 +216,9 @@ def private_credit_loan_model(
             ending_balance = par_value
             fees = 0.0
             remaining_balance_payment = 0
-            total_payment = -(par_value * (1 - oid))
+            total_payment = -original_investment
         else:
-            invested_amount = par_value * (1 - oid)
+            invested_amount = 0.0
             sofr_rate = resolved_sofr
             spread_rate = spread
             pik_rate = pik_interest
@@ -219,6 +242,7 @@ def private_credit_loan_model(
                 "investment_name": investment_name,
                 "quarter_end": quarter_end,
                 "par_value": par_value,
+                "original_investment": original_investment,
                 "invested_amount": invested_amount,
                 "base_rate": base_rate,
                 "sofr_rate": resolved_sofr,
@@ -244,21 +268,48 @@ def private_credit_loan_model(
 
     loan_df = pd.DataFrame(rows)
 
-    irr_values = []
-    total_payments = loan_df["total_payment"].tolist()
-    remaining_balance_payments = loan_df["remaining_balance_payment"].tolist()
-    adjusted_payments = [
-        total_payment - remaining_balance_payment
-        for total_payment, remaining_balance_payment in zip(
-            total_payments,
-            remaining_balance_payments,
-        )
-    ]
-    ending_balances = loan_df["ending_balance"].tolist()
+    if spread_table is not None:
+        loan_df = loan_df.merge(
+            spread_table[["date", "effective_yield", "yield_status"]],
+            left_on="quarter_end",
+            right_on="date",
+            how="left",
+        ).drop(columns="date")
+    else:
+        loan_df["effective_yield"] = float(spread)
+        loan_df["yield_status"] = "fixed"
 
-    for idx, _ in enumerate(adjusted_payments):
-        cumulative_cashflows = adjusted_payments[: idx + 1]
-        cumulative_cashflows.append(ending_balances[idx])
+    oid_total_value = par_value - original_investment
+    num_periods = len(loan_df) - 1
+    loan_df["oid_value"] = 0.0
+    if num_periods > 0:
+        loan_df.loc[1:, "oid_value"] = oid_total_value / num_periods
+
+    loan_df["nav_oid"] = 0.0
+    loan_df.at[0, "nav_oid"] = original_investment
+    for i in range(1, len(loan_df)):
+        loan_df.at[i, "nav_oid"] = loan_df.at[i - 1, "nav_oid"] + loan_df.at[i, "oid_value"]
+
+    # loan_df["nav_oid_pik"] = loan_df["nav_oid"] + loan_df["pik_interest"]
+
+    loan_df["effective_yield_change"] = loan_df["effective_yield"] - spread
+    loan_df["nav"] = loan_df["nav_oid"] * (1 - loan_df["effective_yield_change"])
+    loan_df.loc[len(loan_df) - 1, "nav"] = 0
+    loan_df["contributions"] = loan_df["invested_amount"] * -1.0
+    loan_df["distributions"] = loan_df["cash_interest"] + loan_df["amortization"] + loan_df["fees"] + loan_df["remaining_balance_payment"]
+    loan_df["ncf"] = loan_df["contributions"] + loan_df["distributions"]
+    loan_df["cumulative_contributions"] = loan_df["contributions"].cumsum()
+    loan_df["cumulative_distributions"] = loan_df["distributions"].cumsum()
+    loan_df["cumulative_ncf"] = loan_df["ncf"].cumsum()
+    loan_df["tvpi"] = (loan_df["cumulative_distributions"] + loan_df["nav"]) / -loan_df["cumulative_contributions"]
+
+    irr_values = []
+    ncf = loan_df["ncf"].tolist()
+    nav = loan_df["nav"].tolist()
+
+    for idx, _ in enumerate(ncf):
+        cumulative_cashflows = ncf[: idx + 1]
+        cumulative_cashflows.append(nav[idx])
         quarterly_irr = _irr_quarterly(cumulative_cashflows)
         irr_values.append(_format_irr(quarterly_irr, idx + 1))
 
@@ -266,7 +317,7 @@ def private_credit_loan_model(
     loan_df.at[0, "irr"] = None
     return loan_df
 
-def loan_portfolio(schedule_of_investments, sofr_rates=None):
+def loan_portfolio(schedule_of_investments, sofr_rates=None, spreads=None):
     """Aggregate multiple loans into portfolio-level output tables.
 
     Parameters
@@ -280,6 +331,10 @@ def loan_portfolio(schedule_of_investments, sofr_rates=None):
     sofr_rates : pandas.DataFrame or None, default=None
         Optional SOFR history used for loans whose ``sofr_assumption`` is set to
         ``"actual"``.
+    spreads : pandas.DataFrame or None, default=None
+        Optional spread history used for loans whose ``spread`` is set to
+        ``"actual"``. Expected to be the output of
+        ``data.ratings.get_effective_yield()``.
 
     Returns
     -------
@@ -304,7 +359,7 @@ def loan_portfolio(schedule_of_investments, sofr_rates=None):
     #         "investment_date": [pd.Timestamp("2020-03-31"), pd.Timestamp("2020-06-30"), pd.Timestamp("2020-09-30"), pd.Timestamp("2020-12-31"), pd.Timestamp("2021-03-31")],
     #         "maturity_date": [pd.Timestamp("2025-06-30"), pd.Timestamp("2027-06-30"), pd.Timestamp("2026-12-31"), pd.Timestamp("2028-03-31"), pd.Timestamp("2029-06-30")],
     #         "par_value": [1_000_000, 1_250_000, 1_000_000, 1_050_000, 1_600_000],
-    #         "spread": [0.07, 0.06, 0.06, 0.08, 0.07],
+    #         "spread": ['actual', 'actual', 'actual', 'actual', 'actual'],
     #         "base_rate": ['SOFR', 'SOFR', 'SOFR', 'SOFR', 'SOFR'],
     #         "sofr_assumption": ['actual', 'actual', 'actual', 'actual', 'actual'],
     #         "pik_interest": [0.02, 0.02, 0.02, 0.02, 0.02],
@@ -314,7 +369,9 @@ def loan_portfolio(schedule_of_investments, sofr_rates=None):
     #         "prepayment_date": [None, None, None, None, None],
     #     }
     # )
-    # sofr_rates=get_sofr_data(api_key=fred_api_key, frequency='D')
+    # sofr_rates=get_sofr_data(api_key=fred_api_key, frequency='D', end_date=schedule_of_investments['maturity_date'].max())
+    # spreads=get_effective_yield(rating="B", api_key=fred_api_key, frequency='D', end_date=schedule_of_investments['maturity_date'].max())
+
     ####
 
     if not isinstance(schedule_of_investments, pd.DataFrame):
@@ -351,13 +408,28 @@ def loan_portfolio(schedule_of_investments, sofr_rates=None):
         else:
             sofr_rates_for_loan = 0.04
 
+        spread_value = investment["spread"]
+        if isinstance(spread_value, str) and spread_value.strip().lower() == "actual":
+            if spreads is None:
+                raise ValueError(
+                    "spreads is required when schedule_of_investments uses 'actual' spread values."
+                )
+            spread_for_loan = spreads
+        else:
+            try:
+                spread_for_loan = float(spread_value)
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    "spread must be numeric or the literal 'actual'."
+                ) from exc
+
         loan_cashflow_frames.append(
             private_credit_loan_model(
                 investment_name=investment["investment_name"],
                 investment_date=investment["investment_date"],
                 maturity_date=investment["maturity_date"],
                 par_value=investment["par_value"],
-                spread=investment["spread"],
+                spread=spread_for_loan,
                 base_rate=investment["base_rate"],
                 sofr_rates=sofr_rates_for_loan,
                 # cash_interest_rate=investment["cash_interest_rate"],
@@ -377,27 +449,33 @@ def loan_portfolio(schedule_of_investments, sofr_rates=None):
     portfolio_df = funds_df.groupby("quarter_end").agg(
         {
             "invested_amount": "sum",
+            "amortization": "sum",
+            "cash_interest": "sum",
+            "fees": "sum",
+            "remaining_balance_payment": "sum",
             "total_payment": "sum",
             "remaining_balance_payment": "sum",
             "ending_balance": "sum",
-            "beginning_balance": "sum"
+            "beginning_balance": "sum",
+            "nav": "sum",
+            "contributions": "sum",
+            "distributions": "sum",
+            "ncf": "sum",
+            "cumulative_contributions": "sum",
+            "cumulative_distributions": "sum",
+            "cumulative_ncf": "sum",
         }
     ).reset_index()
 
     portfolio_df['irr'] = None
-    paid_in_capital = (-portfolio_df["total_payment"].clip(upper=0)).cumsum()
-    cumulative_distributions = portfolio_df["total_payment"].clip(lower=0).cumsum()
-    portfolio_df["tvpi"] = (
-        (cumulative_distributions + portfolio_df["ending_balance"])
-        / paid_in_capital.where(paid_in_capital != 0)
-    )
+    portfolio_df["tvpi"] = (portfolio_df["cumulative_distributions"] + portfolio_df["nav"]) / -portfolio_df["cumulative_contributions"]
 
     for i in range(1, len(portfolio_df)):
         # i = 5
         quarter_date = portfolio_df.at[i, "quarter_end"]
         cfs = portfolio_df[portfolio_df["quarter_end"] <= quarter_date].copy()
-        cfs['irr_cfs'] = cfs['total_payment']
-        cfs.at[i, 'irr_cfs'] = cfs.at[i, 'irr_cfs'] - cfs.at[i, 'remaining_balance_payment'] + cfs.at[i, 'ending_balance']
+        cfs['irr_cfs'] = cfs['ncf']
+        cfs.at[i, 'irr_cfs'] = cfs.at[i, 'irr_cfs'] + cfs.at[i, 'nav']
         quarterly_irr = _irr_quarterly(cfs['irr_cfs'].tolist())
         portfolio_df.at[i, 'irr'] = _format_irr(quarterly_irr, i)
 
