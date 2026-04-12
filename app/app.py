@@ -1,9 +1,9 @@
+
 from __future__ import annotations
 
 import os
 import sys
 from pathlib import Path
-import random
 from functools import lru_cache
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -20,6 +20,8 @@ from data.ratings import get_effective_yield
 from data.sofr import get_sofr_data
 
 REQUIRED_COLUMNS = [
+    "company_uid",
+    "investment_uid",
     "investment_name",
     "investment_date",
     "maturity_date",
@@ -36,7 +38,6 @@ REQUIRED_COLUMNS = [
 
 NUMERIC_COLUMNS = [
     "par_value",
-    "spread",
     "pik_interest",
     "amortization",
     "oid",
@@ -45,6 +46,9 @@ NUMERIC_COLUMNS = [
 
 LINE_BLUE = "#2563eb"
 LIGHT_BLUE = "#7dd3fc"
+CHART_LINE_WIDTH = 2
+CHART_MARKER_SIZE = 7
+DEFAULT_SCHEDULE_PATH = Path(__file__).resolve().parent.parent / "app/loan_schedule.csv"
 FRED_API_KEY = os.getenv("FRED_API_KEY")
 SOFR_RATES = pd.DataFrame()
 DEFAULT_SCHEDULE_INVESTMENT_END_DATE = "2024-12-31"
@@ -52,6 +56,8 @@ DEFAULT_SCHEDULE_INVESTMENT_END_DATE = "2024-12-31"
 
 def _default_row(index: int) -> dict:
     return {
+        "company_uid": f"company-{index}",
+        "investment_uid": f"investment-{index}",
         "investment_name": f"Loan {index}",
         "investment_date": "2020-12-31",
         "maturity_date": "2030-12-31",
@@ -65,15 +71,6 @@ def _default_row(index: int) -> dict:
         "exit_fee": 0.02,
         "prepayment_date": "",
     }
-
-
-def _random_quarter_end(
-    random_generator: random.Random,
-    start_date: str,
-    end_date: str,
-) -> pd.Timestamp:
-    quarter_ends = pd.date_range(start=start_date, end=end_date, freq="QE")
-    return random_generator.choice(list(quarter_ends))
 
 
 @lru_cache(maxsize=1)
@@ -115,69 +112,21 @@ def _lookup_rate_value_on_or_before_date(
 
 
 def default_schedule() -> pd.DataFrame:
-    random_generator = random.Random()
-    rows = []
-    sofr_history = pd.DataFrame()
-    b_yield_history = pd.DataFrame()
+    if not DEFAULT_SCHEDULE_PATH.exists():
+        raise FileNotFoundError(
+            f"Default loan schedule file not found: {DEFAULT_SCHEDULE_PATH}"
+        )
 
-    if FRED_API_KEY:
-        try:
-            sofr_history = _get_daily_sofr_history(
-                FRED_API_KEY,
-                DEFAULT_SCHEDULE_INVESTMENT_END_DATE,
-            )
-            b_yield_history = _get_daily_b_yield_history(
-                FRED_API_KEY,
-                DEFAULT_SCHEDULE_INVESTMENT_END_DATE,
-            )
-        except Exception:
-            sofr_history = pd.DataFrame()
-            b_yield_history = pd.DataFrame()
+    default_df = pd.read_csv(DEFAULT_SCHEDULE_PATH, keep_default_na=False)
+    missing_columns = [
+        column_name for column_name in REQUIRED_COLUMNS if column_name not in default_df.columns
+    ]
+    if missing_columns:
+        raise ValueError(
+            f"Default loan schedule is missing required columns: {missing_columns}"
+        )
 
-    for index in range(1, 26):
-        row = _default_row(index)
-        investment_date = _random_quarter_end(
-            random_generator,
-            "2020-12-31",
-            "2024-12-31",
-        )
-        maturity_date = _random_quarter_end(
-            random_generator,
-            "2030-12-31",
-            "2035-12-31",
-        )
-        row["investment_date"] = investment_date.strftime("%Y-%m-%d")
-        row["maturity_date"] = maturity_date.strftime("%Y-%m-%d")
-        row["par_value"] = int(
-            round(random_generator.uniform(15000000, 100000000) / 1_000_000)
-            * 1_000_000
-        )
-        row["oid"] = round(random_generator.uniform(0.02, 0.05), 4)
-        sofr_value = _lookup_rate_value_on_or_before_date(
-            sofr_history,
-            investment_date,
-            "sofr",
-        )
-        spread_value = _lookup_rate_value_on_or_before_date(
-            b_yield_history,
-            investment_date,
-            "effective_yield",
-        )
-        row["sofr_assumption"] = (
-            round(sofr_value, 4)
-            if sofr_value is not None
-            else round(random_generator.uniform(0.035, 0.04), 4)
-        )
-        row["spread"] = (
-            round(spread_value, 4)
-            if spread_value is not None
-            else round(random_generator.uniform(0.08, 0.11), 4)
-        )
-        # row["sofr_assumption"] = 'actual'
-        # row["spread"] = 'actual'
-        rows.append(row)
-
-    return pd.DataFrame(rows)
+    return default_df[REQUIRED_COLUMNS].copy()
 
 
 def _sort_schedule_by_investment_date(df: pd.DataFrame) -> pd.DataFrame:
@@ -187,7 +136,6 @@ def _sort_schedule_by_investment_date(df: pd.DataFrame) -> pd.DataFrame:
         .drop(columns="_investment_date_sort")
         .reset_index(drop=True)
     )
-    sorted_df["investment_name"] = [f"Loan {i + 1}" for i in range(len(sorted_df))]
     return sorted_df
 
 
@@ -230,6 +178,12 @@ def _coerce_sofr_assumption(value: object) -> str | float:
 
 def _schedule_uses_actual_sofr(df: pd.DataFrame) -> bool:
     return df["sofr_assumption"].apply(
+        lambda value: isinstance(value, str) and value.lower() == "actual"
+    ).any()
+
+
+def _schedule_uses_actual_spread(df: pd.DataFrame) -> bool:
+    return df["spread"].apply(
         lambda value: isinstance(value, str) and value.lower() == "actual"
     ).any()
 
@@ -469,6 +423,82 @@ def _clean_series(series: pd.Series) -> pd.Series:
     return numeric.where(numeric.apply(lambda x: not (isinstance(x, float) and math.isnan(x))))
 
 
+def _add_status_colored_line_traces(
+    fig: go.Figure,
+    df: pd.DataFrame,
+    x_column: str,
+    y_column: str,
+    trace_name: str,
+) -> None:
+    if df.empty or x_column not in df.columns or y_column not in df.columns:
+        return
+
+    working_df = df[[x_column, y_column]].copy()
+    if "status" in df.columns:
+        working_df["status"] = df["status"].fillna("projected").astype(str).str.lower()
+    else:
+        working_df["status"] = "actual"
+
+    working_df = working_df.dropna(subset=[x_column, y_column]).reset_index(drop=True)
+    if working_df.empty:
+        return
+
+    status_colors = {
+        "actual": LINE_BLUE,
+        "projected": LIGHT_BLUE,
+    }
+
+    segment_ids = working_df["status"].ne(working_df["status"].shift()).cumsum()
+    legend_shown_for_status: set[str] = set()
+
+    for _, segment in working_df.groupby(segment_ids, sort=False):
+        segment_status = str(segment["status"].iloc[0]).lower()
+        color = status_colors.get(segment_status, LIGHT_BLUE)
+
+        x_values = segment[x_column].tolist()
+        y_values = segment[y_column].tolist()
+        marker_sizes = [CHART_MARKER_SIZE] * len(segment)
+
+        segment_start_index = int(segment.index[0])
+        if segment_start_index > 0:
+            previous_row = working_df.iloc[segment_start_index - 1]
+            x_values.insert(0, previous_row[x_column])
+            y_values.insert(0, previous_row[y_column])
+            marker_sizes.insert(0, 0)
+
+        status_label = "Actual" if segment_status == "actual" else "Projected"
+        fig.add_trace(
+            go.Scatter(
+                x=x_values,
+                y=y_values,
+                mode="lines+markers",
+                name=f"{trace_name} ({status_label})",
+                line={"color": color, "width": CHART_LINE_WIDTH},
+                marker={"color": color, "size": marker_sizes},
+                showlegend=segment_status not in legend_shown_for_status,
+            )
+        )
+        legend_shown_for_status.add(segment_status)
+
+
+def _apply_standard_chart_layout(
+    fig: go.Figure,
+    title_text: str,
+    *,
+    left_margin: int = 20,
+    right_margin: int = 20,
+    bottom_margin: int = 20,
+) -> None:
+    fig.update_layout(
+        title=dict(text=title_text, y=0.95, yanchor="top"),
+        template="plotly_dark",
+        paper_bgcolor="#1f2937",
+        plot_bgcolor="#1f2937",
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
+        margin={"l": left_margin, "r": right_margin, "t": 90, "b": bottom_margin},
+    )
+
+
 def _format_column_label(column_name: str) -> str:
     if str(column_name).lower() == "sofr_assumption":
         return "SOFR"
@@ -476,9 +506,12 @@ def _format_column_label(column_name: str) -> str:
     replacements = {
         "irr": "IRR",
         "tvpi": "TVPI",
+        "nav": "NAV",
+        "ncf": "NCF",
         "sofr": "SOFR",
         "pik": "PIK",
         "oid": "OID",
+        "uid": "UID",
     }
     parts = str(column_name).split("_")
     formatted_parts = [replacements.get(part.lower(), part.title()) for part in parts]
@@ -547,24 +580,16 @@ app_ui = ui.page_navbar(
             #schedule_df [role="columnheader"] {
                 background-color: #343a40 !important;
                 color: #ffffff !important;
-                font-size: 0.8rem !important;
+                font-size: 0.9rem !important;
             }
             #schedule_df table tbody td,
             #schedule_df [role="gridcell"] {
-                font-size: 0.8rem !important;
+                font-size: 0.9rem !important;
                 color: #d1d5db !important;
             }
-            #schedule_df table thead th:nth-child(2),
-            #schedule_df table thead th:nth-child(3),
             #schedule_df table thead th:nth-child(6),
-            #schedule_df table tbody td:nth-child(2),
-            #schedule_df table tbody td:nth-child(3),
             #schedule_df table tbody td:nth-child(6),
-            #schedule_df [role="columnheader"][aria-colindex="2"],
-            #schedule_df [role="columnheader"][aria-colindex="3"],
             #schedule_df [role="columnheader"][aria-colindex="6"],
-            #schedule_df [role="gridcell"][aria-colindex="2"],
-            #schedule_df [role="gridcell"][aria-colindex="3"],
             #schedule_df [role="gridcell"][aria-colindex="6"] {
                 text-align: center !important;
                 justify-content: center !important;
@@ -649,12 +674,70 @@ app_ui = ui.page_navbar(
                 width: max-content !important;
                 min-width: max-content !important;
             }
+            #schedule_df table thead th:nth-child(1),
             #schedule_df table thead th:nth-child(2),
+            #schedule_df table tbody td:nth-child(1),
+            #schedule_df table tbody td:nth-child(2),
+            #schedule_df [role="columnheader"][aria-colindex="1"],
             #schedule_df [role="columnheader"][aria-colindex="2"],
-            #schedule_df table thead th:nth-child(3),
-            #schedule_df [role="columnheader"][aria-colindex="3"],
+            #schedule_df [role="gridcell"][aria-colindex="1"],
+            #schedule_df [role="gridcell"][aria-colindex="2"] {
+                width: 10rem !important;
+                min-width: 10rem !important;
+                max-width: 10rem !important;
+            }
+            #schedule_df table thead th:nth-child(4),
+            #schedule_df table thead th:nth-child(5),
+            #schedule_df table thead th:nth-child(14),
+            #schedule_df table tbody td:nth-child(4),
+            #schedule_df table tbody td:nth-child(5),
+            #schedule_df table tbody td:nth-child(14),
+            #schedule_df [role="columnheader"][aria-colindex="4"],
+            #schedule_df [role="columnheader"][aria-colindex="5"],
+            #schedule_df [role="columnheader"][aria-colindex="14"],
+            #schedule_df [role="gridcell"][aria-colindex="4"],
+            #schedule_df [role="gridcell"][aria-colindex="5"],
+            #schedule_df [role="gridcell"][aria-colindex="14"] {
+                width: 9rem !important;
+                min-width: 9rem !important;
+                max-width: 9rem !important;
+            }
             #schedule_df table thead th:nth-child(7),
+            #schedule_df table thead th:nth-child(8),
+            #schedule_df table thead th:nth-child(9),
+            #schedule_df table tbody td:nth-child(7),
+            #schedule_df table tbody td:nth-child(8),
+            #schedule_df table tbody td:nth-child(9),
             #schedule_df [role="columnheader"][aria-colindex="7"],
+            #schedule_df [role="columnheader"][aria-colindex="8"],
+            #schedule_df [role="columnheader"][aria-colindex="9"],
+            #schedule_df [role="gridcell"][aria-colindex="7"],
+            #schedule_df [role="gridcell"][aria-colindex="8"],
+            #schedule_df [role="gridcell"][aria-colindex="9"] {
+                width: 7.5rem !important;
+                min-width: 7.5rem !important;
+                max-width: 7.5rem !important;
+            }
+            #schedule_df table thead th:nth-child(10),
+            #schedule_df table thead th:nth-child(11),
+            #schedule_df table thead th:nth-child(12),
+            #schedule_df table thead th:nth-child(13),
+            #schedule_df table tbody td:nth-child(10),
+            #schedule_df table tbody td:nth-child(11),
+            #schedule_df table tbody td:nth-child(12),
+            #schedule_df table tbody td:nth-child(13),
+            #schedule_df [role="columnheader"][aria-colindex="10"],
+            #schedule_df [role="columnheader"][aria-colindex="11"],
+            #schedule_df [role="columnheader"][aria-colindex="12"],
+            #schedule_df [role="columnheader"][aria-colindex="13"],
+            #schedule_df [role="gridcell"][aria-colindex="10"],
+            #schedule_df [role="gridcell"][aria-colindex="11"],
+            #schedule_df [role="gridcell"][aria-colindex="12"],
+            #schedule_df [role="gridcell"][aria-colindex="13"] {
+                width: 7.25rem !important;
+                min-width: 7.25rem !important;
+                max-width: 7.25rem !important;
+            }
             #funds_summary_table table thead th:nth-child(2),
             #funds_summary_table [role="columnheader"][aria-colindex="2"],
             #funds_summary_table table thead th:nth-child(3),
@@ -698,10 +781,19 @@ app_ui = ui.page_navbar(
                 padding-left: 10px !important;
                 padding-right: 10px !important;
             }
+            #schedule_df table thead th:nth-child(2),
+            #schedule_df table thead th:nth-child(3),
+            #schedule_df table tbody td:nth-child(2),
+            #schedule_df table tbody td:nth-child(3),
+            #schedule_df [role="columnheader"][aria-colindex="2"],
+            #schedule_df [role="columnheader"][aria-colindex="3"],
+            #schedule_df [role="gridcell"][aria-colindex="2"],
+            #schedule_df [role="gridcell"][aria-colindex="3"] {
+                text-align: left !important;
+                justify-content: flex-start !important;
+            }
             #schedule_df {
-                width: fit-content;
-                margin-left: auto;
-                margin-right: auto;
+                width: 100%;
                 max-width: 100%;
             }
             #schedule_df .shiny-data-grid-summary,
@@ -869,7 +961,7 @@ app_ui = ui.page_navbar(
                         {"style": "flex: 1 1 0; min-width: 0; max-width: 100%;"},
                         ui.h4("Schedule Of Investments", style="font-size: 0.95rem; margin-top: 0; margin-bottom: 0.5rem;"),
                         ui.div(
-                            {"style": "overflow: auto; max-width: 100%; max-height: 70vh;"},
+                            {"style": "overflow: auto; max-width: 100%; height: calc(100vh - 265px); max-height: calc(100vh - 265px);"},
                             ui.output_data_frame("schedule_df"),
                         ),
                         ui.div(
@@ -1047,6 +1139,7 @@ def server(input, output, session):
     base_funds_summary_df = reactive.value(pd.DataFrame())
     base_schedule_snapshot = reactive.value(pd.DataFrame())
     base_sofr_rates = reactive.value(pd.DataFrame())
+    base_spread_rates = reactive.value(pd.DataFrame())
     schedule_has_been_run = reactive.value(False)
 
     @reactive.effect
@@ -1061,18 +1154,12 @@ def server(input, output, session):
     def _reset_schedule():
         schedule_state.set(_sort_schedule_by_investment_date(default_schedule()))
 
-    PCT_DISPLAY_COLUMNS = [
-        "spread",
-        "pik_interest",
-        "amortization",
-        "oid",
-        "exit_fee",
-    ]
+    PCT_DISPLAY_COLUMNS = ["pik_interest", "amortization", "oid", "exit_fee"]
 
     @render.data_frame
     def schedule_df():
         display_df = schedule_state().copy()
-        for col in PCT_DISPLAY_COLUMNS:
+        for col in ["pik_interest", "amortization", "oid", "exit_fee"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda v: f"{float(v) * 100:.2f}%" if v != "" and v is not None else v
@@ -1115,14 +1202,15 @@ def server(input, output, session):
             display_df,
             editable=True,
             selection_mode="rows",
-            width="fit-content",
+            width="100%",
+            height="100%",
             styles=center_styles,
         )
 
     @render.download(filename="loan_schedule.csv")
     def download_schedule_csv():
         display_df = schedule_state().copy()
-        for col in PCT_DISPLAY_COLUMNS:
+        for col in ["pik_interest", "amortization", "oid", "exit_fee"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda v: f"{float(v) * 100:.2f}%" if v != "" and v is not None else v
@@ -1179,24 +1267,34 @@ def server(input, output, session):
 
         normalized_schedule = _coerce_schedule(schedule_state())
 
-        # Force all sofr_assumption values to "actual"
-        normalized_schedule["sofr_assumption"] = "actual"
-
         max_maturity_date = normalized_schedule["maturity_date"].max()
+        end_date_text = pd.Timestamp(max_maturity_date).strftime("%Y-%m-%d")
 
-        if not FRED_API_KEY:
+        needs_actual_sofr = _schedule_uses_actual_sofr(normalized_schedule)
+        needs_actual_spread = _schedule_uses_actual_spread(normalized_schedule)
+
+        if (needs_actual_sofr or needs_actual_spread) and not FRED_API_KEY:
             raise ValueError(
-                "FRED_API_KEY is required to run the schedule with actual SOFR rates."
+                "FRED_API_KEY is required to run the schedule with actual SOFR or spread values."
             )
 
-        SOFR_RATES = _get_daily_sofr_history(
-            FRED_API_KEY,
-            pd.Timestamp(max_maturity_date).strftime("%Y-%m-%d"),
-        ).copy()
+        if needs_actual_sofr:
+            SOFR_RATES = _get_daily_sofr_history(FRED_API_KEY, end_date_text).copy()
+            sofr_rates = SOFR_RATES.copy()
+        else:
+            SOFR_RATES = pd.DataFrame()
+            sofr_rates = None
 
-        sofr_rates = SOFR_RATES.copy()
+        if needs_actual_spread:
+            spread_rates = _get_daily_b_yield_history(FRED_API_KEY, end_date_text).copy()
+        else:
+            spread_rates = None
 
-        result = loan_portfolio(normalized_schedule, sofr_rates=sofr_rates)
+        result = loan_portfolio(
+            normalized_schedule,
+            sofr_rates=sofr_rates,
+            spreads=spread_rates,
+        )
 
         if isinstance(result, tuple):
             if len(result) >= 3:
@@ -1219,6 +1317,7 @@ def server(input, output, session):
         base_funds_summary_df.set(funds_summary_df)
         base_schedule_snapshot.set(normalized_schedule)
         base_sofr_rates.set(SOFR_RATES.copy())
+        base_spread_rates.set(spread_rates.copy())
         schedule_has_been_run.set(True)
 
     @reactive.effect
@@ -1290,8 +1389,13 @@ def server(input, output, session):
         )
 
         sofr_rates = SOFR_RATES.copy()
+        spread_rates = base_spread_rates().copy()
 
-        result = loan_portfolio(shocked_schedule, sofr_rates=sofr_rates)
+        result = loan_portfolio(
+            shocked_schedule,
+            sofr_rates=sofr_rates,
+            spreads=spread_rates,
+        )
 
         if isinstance(result, tuple):
             if len(result) >= 3:
@@ -1444,6 +1548,7 @@ def server(input, output, session):
 
         cumulative = portfolio_df.copy()
         cumulative["cumulative_cashflow"] = cumulative["total_payment"].cumsum()
+        cumulative["status"] = portfolio_df.get("status", "actual")
         bar_colors = [
             "#16a34a" if payment >= 0 else "#dc2626"
             for payment in portfolio_df["total_payment"]
@@ -1459,15 +1564,12 @@ def server(input, output, session):
                 marker_color=bar_colors,
             )
         )
-        fig.add_trace(
-            go.Scatter(
-                x=cumulative["quarter_end"],
-                y=cumulative["cumulative_cashflow"],
-                mode="lines+markers",
-                name="Cumulative Cash Flow",
-                line={"color": LINE_BLUE, "width": 2},
-                marker={"color": LINE_BLUE, "size": 7},
-            )
+        _add_status_colored_line_traces(
+            fig,
+            cumulative,
+            "quarter_end",
+            "cumulative_cashflow",
+            "Cumulative Cash Flow",
         )
         fig.add_trace(
             go.Scatter(
@@ -1479,14 +1581,7 @@ def server(input, output, session):
                 opacity=0.2,
             )
         )
-        fig.update_layout(
-            title=dict(text="Cash Flow and Remaining Balance", y=0.95, yanchor="top"),
-            template="plotly_dark",
-            paper_bgcolor="#1f2937",
-            plot_bgcolor="#1f2937",
-            legend={"orientation": "h", "y": 1.05, "x": 0},
-            margin={"l": 20, "r": 20, "t": 80, "b": 20},
-        )
+        _apply_standard_chart_layout(fig, "Cash Flow and Remaining Balance")
         fig.update_xaxes(title="Quarter End")
         fig.update_yaxes(title_text="Value")
         return fig
@@ -1494,9 +1589,14 @@ def server(input, output, session):
     @render_widget
     def sofr_rate_chart():
         try:
-            portfolio_results()
+            portfolio_df, _, _ = portfolio_results()
         except Exception as exc:
             return _empty_figure(str(exc))
+
+        portfolio_start_date = pd.to_datetime(
+            portfolio_df.get("quarter_end"),
+            errors="coerce",
+        ).min()
 
         if SOFR_RATES.empty or "sofr" not in SOFR_RATES.columns:
             return _empty_figure("SOFR rate data is unavailable.")
@@ -1527,36 +1627,44 @@ def server(input, output, session):
                 "date", kind="stable"
             ).reset_index(drop=True)
 
-        fig = go.Figure()
-        status_colors = {
-            "actual": LINE_BLUE,
-            "assumed": LIGHT_BLUE,
-        }
+        if pd.notna(portfolio_start_date):
+            sofr_by_quarter = sofr_by_quarter.loc[
+                sofr_by_quarter["date"] >= portfolio_start_date
+            ].reset_index(drop=True)
 
-        for rate_status, status_group in sofr_by_quarter.groupby("rate_status", sort=False):
-            fig.add_trace(
-                go.Scatter(
-                    x=status_group["date"],
-                    y=status_group["sofr"],
-                    mode="lines+markers",
-                    name=f"SOFR Rate ({str(rate_status).title()})",
-                    line={"color": status_colors.get(str(rate_status).lower(), LIGHT_BLUE), "width": 2},
-                    marker={"color": status_colors.get(str(rate_status).lower(), LIGHT_BLUE), "size": 7},
-                )
-            )
+        if sofr_by_quarter.empty:
+            return _empty_figure("SOFR rate data is unavailable for the portfolio period.")
+
+        sofr_by_quarter = sofr_by_quarter.rename(columns={"date": "quarter_end"})
+        sofr_by_quarter["status"] = (
+            sofr_by_quarter["rate_status"]
+            .fillna("assumed")
+            .astype(str)
+            .str.lower()
+            .replace({"assumed": "projected"})
+        )
+
+        fig = go.Figure()
+        _add_status_colored_line_traces(
+            fig,
+            sofr_by_quarter,
+            "quarter_end",
+            "sofr",
+            "SOFR Rate",
+        )
+        _apply_standard_chart_layout(
+            fig,
+            "SOFR Rate",
+            bottom_margin=75,
+        )
         fig.update_layout(
-            title=dict(text="SOFR Rate", y=0.95, yanchor="top"),
-            template="plotly_dark",
-            paper_bgcolor="#1f2937",
-            plot_bgcolor="#1f2937",
-            margin={"l": 20, "r": 20, "t": 80, "b": 50},
             annotations=[
                 {
                     "text": "source: Federal Reserve Bank of ST. LOUIS",
                     "xref": "paper",
                     "yref": "paper",
                     "x": 0,
-                    "y": -0.22,
+                    "y": -0.2,
                     "showarrow": False,
                     "xanchor": "left",
                     "font": {"size": 10, "color": "#9ca3af"},
@@ -1576,21 +1684,19 @@ def server(input, output, session):
 
         tvpi_series = _clean_series(portfolio_df["tvpi"])
         tvpi_df = portfolio_df[["quarter_end"]].copy()
+        tvpi_df["status"] = portfolio_df.get("status", "actual")
         tvpi_df["tvpi"] = tvpi_series
         tvpi_df = tvpi_df.dropna(subset=["tvpi"])
 
         fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=tvpi_df["quarter_end"],
-                y=tvpi_df["tvpi"],
-                mode="lines+markers",
-                name="TVPI",
-                line={"color": LINE_BLUE, "width": 2},
-                marker={"color": LINE_BLUE, "size": 7},
-            )
+        _add_status_colored_line_traces(
+            fig,
+            tvpi_df,
+            "quarter_end",
+            "tvpi",
+            "TVPI",
         )
-        fig.update_layout(title=dict(text="Portfolio Gross TVPI", y=0.95, yanchor="top"), template="plotly_dark", paper_bgcolor="#1f2937", plot_bgcolor="#1f2937", margin={"l": 20, "r": 20, "t": 80, "b": 20})
+        _apply_standard_chart_layout(fig, "Portfolio Gross TVPI")
         fig.update_xaxes(title="Quarter End")
         fig.update_yaxes(title="TVPI", tickformat=".2f")
         return fig
@@ -1604,21 +1710,19 @@ def server(input, output, session):
 
         irr_series = _clean_series(portfolio_df["irr"])
         irr_df = portfolio_df[["quarter_end"]].copy()
+        irr_df["status"] = portfolio_df.get("status", "actual")
         irr_df["irr"] = irr_series
         irr_df = irr_df.dropna(subset=["irr"])
 
         fig = go.Figure()
-        fig.add_trace(
-            go.Scatter(
-                x=irr_df["quarter_end"],
-                y=irr_df["irr"],
-                mode="lines+markers",
-                name="Portfolio IRR",
-                line={"color": LINE_BLUE, "width": 2},
-                marker={"color": LINE_BLUE, "size": 7},
-            )
+        _add_status_colored_line_traces(
+            fig,
+            irr_df,
+            "quarter_end",
+            "irr",
+            "Portfolio IRR",
         )
-        fig.update_layout(title=dict(text="Portfolio Gross IRR", y=0.95, yanchor="top"), template="plotly_dark", paper_bgcolor="#1f2937", plot_bgcolor="#1f2937", margin={"l": 20, "r": 20, "t": 80, "b": 20})
+        _apply_standard_chart_layout(fig, "Portfolio Gross IRR")
         fig.update_xaxes(title="Quarter End")
         fig.update_yaxes(title="IRR", tickformat=".2%")
         return fig
@@ -1641,7 +1745,22 @@ def server(input, output, session):
             display_df = display_df[columns]
         if "quarter_end" in display_df.columns:
             display_df["quarter_end"] = pd.to_datetime(display_df["quarter_end"]).dt.strftime("%Y-%m-%d")
-        for col in ["invested_amount", "total_payment", "beginning_balance", "ending_balance"]:
+        for col in [
+            "invested_amount",
+            "amortization",
+            "cash_interest",
+            "fees",
+            "total_payment",
+            "beginning_balance",
+            "ending_balance",
+            "nav",
+            "contributions",
+            "distributions",
+            "ncf",
+            "cumulative_contributions",
+            "cumulative_distributions",
+            "cumulative_ncf",
+        ]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda value: f"{float(value):,.2f}" if pd.notna(value) else ""
@@ -1693,7 +1812,22 @@ def server(input, output, session):
             display_df = display_df[columns]
         if "quarter_end" in display_df.columns:
             display_df["quarter_end"] = pd.to_datetime(display_df["quarter_end"]).dt.strftime("%Y-%m-%d")
-        for col in ["invested_amount", "total_payment", "beginning_balance", "ending_balance"]:
+        for col in [
+            "invested_amount",
+            "amortization",
+            "cash_interest",
+            "fees",
+            "total_payment",
+            "beginning_balance",
+            "ending_balance",
+            "nav",
+            "contributions",
+            "distributions",
+            "ncf",
+            "cumulative_contributions",
+            "cumulative_distributions",
+            "cumulative_ncf",
+        ]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda value: f"{float(value):,.2f}" if pd.notna(value) else ""
@@ -1755,6 +1889,15 @@ def server(input, output, session):
             "fees",
             "remaining_balance_payment",
             "total_payment",
+            "oid_value",
+            "nav_oid",
+            "nav",
+            "contributions",
+            "distributions",
+            "ncf",
+            "cumulative_contributions",
+            "cumulative_distributions",
+            "cumulative_ncf",
         ]
         for column_name in currency_columns:
             if column_name in display_df.columns:
@@ -1765,6 +1908,8 @@ def server(input, output, session):
         rate_columns = [
             "sofr_rate",
             "spread",
+            "effective_yield",
+            "effective_yield_change",
             "pik_rate",
             "cash_interest_rate",
             "oid",
@@ -1776,6 +1921,11 @@ def server(input, output, session):
                 display_df[column_name] = display_df[column_name].apply(
                     lambda value: f"{float(value) * 100:.2f}%" if pd.notna(value) else ""
                 )
+
+        if "tvpi" in display_df.columns:
+            display_df["tvpi"] = display_df["tvpi"].apply(
+                lambda value: f"{float(value):.2f}x" if pd.notna(value) else ""
+            )
 
         display_df = _format_table_headers(display_df)
 
@@ -1844,11 +1994,17 @@ def server(input, output, session):
                 else (f"{float(value) * 100:.2f}%" if pd.notna(value) else "")
             )
 
-        for col in ["spread", "pik_interest", "amortization", "oid", "exit_fee", "irr"]:
+        for col in ["pik_interest", "amortization", "oid", "exit_fee", "irr"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda value: f"{float(value) * 100:.2f}%" if pd.notna(value) else ""
                 )
+        if "spread" in display_df.columns:
+            display_df["spread"] = display_df["spread"].apply(
+                lambda value: "actual"
+                if isinstance(value, str) and value.lower() == "actual"
+                else (f"{float(value) * 100:.2f}%" if pd.notna(value) else "")
+            )
 
         display_df = _format_table_headers(display_df)
 
@@ -1917,11 +2073,17 @@ def server(input, output, session):
                 else (f"{float(value) * 100:.2f}%" if pd.notna(value) else "")
             )
 
-        for col in ["spread", "pik_interest", "amortization", "oid", "exit_fee", "irr"]:
+        for col in ["pik_interest", "amortization", "oid", "exit_fee", "irr"]:
             if col in display_df.columns:
                 display_df[col] = display_df[col].apply(
                     lambda value: f"{float(value) * 100:.2f}%" if pd.notna(value) else ""
                 )
+        if "spread" in display_df.columns:
+            display_df["spread"] = display_df["spread"].apply(
+                lambda value: "actual"
+                if isinstance(value, str) and value.lower() == "actual"
+                else (f"{float(value) * 100:.2f}%" if pd.notna(value) else "")
+            )
 
         display_df = _format_table_headers(display_df)
         yield display_df.to_csv(index=False)

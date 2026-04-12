@@ -7,6 +7,26 @@ main modeling code can stay oriented around business logic.
 
 import pandas as pd
 
+
+def npv(rate, cashflows):
+    """Calculate net present value for a periodic cash flow series.
+
+    Parameters
+    ----------
+    rate : float
+        Discount rate applied per period.
+    cashflows : sequence of float
+        Ordered cash flow series where the first cash flow occurs at period
+        zero.
+
+    Returns
+    -------
+    float
+        Net present value of the discounted cash flows.
+    """
+
+    return sum(cashflow / ((1 + rate) ** period) for period, cashflow in enumerate(cashflows))
+
 def _irr_quarterly(cashflows, tolerance=1e-10, max_iterations=200):
     """Estimate a quarterly IRR using a bisection search.
 
@@ -31,13 +51,10 @@ def _irr_quarterly(cashflows, tolerance=1e-10, max_iterations=200):
     if not (has_positive and has_negative):
         return None
 
-    def npv(rate):
-        return sum(cf / ((1 + rate) ** idx) for idx, cf in enumerate(cashflows))
-
     low = -0.9999
     high = 10.0
-    npv_low = npv(low)
-    npv_high = npv(high)
+    npv_low = npv(low, cashflows)
+    npv_high = npv(high, cashflows)
 
     if npv_low == 0:
         return low
@@ -48,7 +65,7 @@ def _irr_quarterly(cashflows, tolerance=1e-10, max_iterations=200):
 
     for _ in range(max_iterations):
         mid = (low + high) / 2
-        npv_mid = npv(mid)
+        npv_mid = npv(mid, cashflows)
 
         if abs(npv_mid) <= tolerance:
             return mid
