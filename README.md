@@ -48,6 +48,8 @@ The core modeling package exposes a small API in `asset_modeling.credit` and
 
 Builds a quarterly loan-level cash flow schedule for a single investment.
 
+- Accepts an optional `as_of_date` argument and labels each quarter-end row as
+  `actual` or `projected` in the returned DataFrame.
 - Accepts either a SOFR history DataFrame with `date` and `sofr` columns or a
 	fixed float assumption through `sofr_rates`.
 - Returns a DataFrame with quarter-end balances, payment components,
